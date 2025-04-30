@@ -939,15 +939,16 @@ void test_model(CNN* cnn, const char** test_image_paths, int num_test_images) {
 }
 
 // Function to read image paths from a directory
-// Function to read image paths from a directory
-int read_directory(const char* dir_path, char*** paths, const char** class_names, int num_classes) {
+int read_directory(const char* dir_path, char*** paths, const char** class_names, int num_classes, int max_per_class) {
     int total_images = 0;
     *paths = NULL;
 
-    // First count the total number of images
+    // First count the total number of images (up to max_per_class per class)
     for (int class_idx = 0; class_idx < num_classes; class_idx++) {
         char class_path[1024];
         snprintf(class_path, sizeof(class_path), "%s/%s", dir_path, class_names[class_idx]);
+
+        int class_count = 0;
 
 #ifdef _WIN32
         // Windows implementation
@@ -967,22 +968,26 @@ int read_directory(const char* dir_path, char*** paths, const char** class_names
                 _stricmp(ext, ".jpg") == 0 ||
                 _stricmp(ext, ".jpeg") == 0 ||
                 _stricmp(ext, ".png") == 0)) {
-                total_images++;
+                if (max_per_class == -1 || class_count < max_per_class) {
+                    total_images++;
+                    class_count++;
+                }
             }
-        } while (FindNextFile(hFind, &findFileData) != 0);
+        } while (FindNextFile(hFind, &findFileData) != 0 && (max_per_class == -1 || class_count < max_per_class));
         FindClose(hFind);
 #else
         // Linux/macOS implementation
         DIR *dir;
         struct dirent *ent;
         if ((dir = opendir(class_path)) != NULL) {
-            while ((ent = readdir(dir)) != NULL) {
+            while ((ent = readdir(dir)) != NULL && (max_per_class == -1 || class_count < max_per_class)) {
                 const char* ext = strrchr(ent->d_name, '.');
                 if (ext != NULL && (
                         strcasecmp(ext, ".jpg") == 0 ||
                         strcasecmp(ext, ".jpeg") == 0 ||
                         strcasecmp(ext, ".png") == 0)) {
                     total_images++;
+                    class_count++;
                 }
             }
             closedir(dir);
@@ -1005,11 +1010,13 @@ int read_directory(const char* dir_path, char*** paths, const char** class_names
         return 0;
     }
 
-    // Now actually store the paths
+    // Now actually store the paths (up to max_per_class per class)
     int current_idx = 0;
     for (int class_idx = 0; class_idx < num_classes; class_idx++) {
         char class_path[1024];
         snprintf(class_path, sizeof(class_path), "%s/%s", dir_path, class_names[class_idx]);
+
+        int class_count = 0;
 
 #ifdef _WIN32
         // Windows implementation
@@ -1026,28 +1033,30 @@ int read_directory(const char* dir_path, char*** paths, const char** class_names
                 _stricmp(ext, ".jpg") == 0 ||
                 _stricmp(ext, ".jpeg") == 0 ||
                 _stricmp(ext, ".png") == 0)) {
-
-                (*paths)[current_idx] = (char*)malloc(1024);
-                snprintf((*paths)[current_idx], 1024, "%s/%s", class_path, findFileData.cFileName);
-                current_idx++;
+                if (max_per_class == -1 || class_count < max_per_class) {
+                    (*paths)[current_idx] = (char*)malloc(1024);
+                    snprintf((*paths)[current_idx], 1024, "%s/%s", class_path, findFileData.cFileName);
+                    current_idx++;
+                    class_count++;
+                }
             }
-        } while (FindNextFile(hFind, &findFileData) != 0);
+        } while (FindNextFile(hFind, &findFileData) != 0 && (max_per_class == -1 || class_count < max_per_class));
         FindClose(hFind);
 #else
         // Linux/macOS implementation
         DIR *dir;
         struct dirent *ent;
         if ((dir = opendir(class_path)) != NULL) {
-            while ((ent = readdir(dir)) != NULL) {
+            while ((ent = readdir(dir)) != NULL && (max_per_class == -1 || class_count < max_per_class)) {
                 const char* ext = strrchr(ent->d_name, '.');
                 if (ext != NULL && (
                         strcasecmp(ext, ".jpg") == 0 ||
                         strcasecmp(ext, ".jpeg") == 0 ||
                         strcasecmp(ext, ".png") == 0)) {
-
                     (*paths)[current_idx] = (char*)malloc(1024);
                     snprintf((*paths)[current_idx], 1024, "%s/%s", class_path, ent->d_name);
                     current_idx++;
+                    class_count++;
                 }
             }
             closedir(dir);
@@ -1063,15 +1072,30 @@ int main(int argc, char** argv) {
     // Seed random number generator
     srand(time(NULL));
 
+    // Default number of training images per class (-1 means all available)
+    int train_images_per_class = -1;
+
+    // Parse command line arguments
+    if (argc > 1) {
+        train_images_per_class = atoi(argv[1]);
+        if (train_images_per_class <= 0) {
+            printf("Usage: %s [num_images_per_class]\n", argv[0]);
+            printf("Where num_images_per_class is the number of training images to use per class (use -1 for all available)\n");
+            return 1;
+        }
+    }
+
     // Create the CNN
     CNN* cnn = create_cnn();
 
     // Define default paths for training, testing, and model saving
     const char* training_dir = "Animals/train";  // Default training directory
-    const char* testing_dir = "Animals/test";    // Default testing directory
+    const char* testing_dir = "Animals/val";    // Default testing directory
     const char* model_path = "animal_model.bin";   // Default model file path
 
     printf("Starting automatic training and testing process...\n");
+    printf("Using %d images per class for training\n",
+           train_images_per_class == -1 ? -1 : train_images_per_class);
 
     // TRAINING PHASE
     printf("\n--- TRAINING PHASE ---\n");
@@ -1081,7 +1105,7 @@ int main(int argc, char** argv) {
 
     // Store image paths for training data
     char** image_paths = NULL;
-    int num_images = read_directory(training_dir, &image_paths, CLASS_NAMES, NUM_CLASSES);
+    int num_images = read_directory(training_dir, &image_paths, CLASS_NAMES, NUM_CLASSES, train_images_per_class);
 
     printf("Found %d training images\n", num_images);
 
@@ -1117,12 +1141,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Read test data
+    // Read test data (use all available test images)
     printf("Loading test data from %s...\n", testing_dir);
 
     // Store image paths for test data
     char** test_image_paths = NULL;
-    int num_test_images = read_directory(testing_dir, &test_image_paths, CLASS_NAMES, NUM_CLASSES);
+    int num_test_images = read_directory(testing_dir, &test_image_paths, CLASS_NAMES, NUM_CLASSES, -1); // -1 means all images
 
     printf("Found %d test images\n", num_test_images);
 
@@ -1143,17 +1167,8 @@ int main(int argc, char** argv) {
     }
     free(test_image_paths);
 
-    // Demonstrate prediction on a specific image
-//    printf("\n--- SAMPLE PREDICTION ---\n");
-//    const char* sample_image = "./sample_animal.jpg";
-//    printf("Predicting sample image: %s\n", sample_image);
-//    int predicted_class = predict(cnn, sample_image);
-//    printf("Prediction: %s\n", CLASS_NAMES[predicted_class]);
-//
-//    // Clean up CNN
-//    free_cnn(cnn);
-
     printf("\nProcess completed successfully!\n");
+    free_cnn(cnn);
     return 0;
 }
 
