@@ -1,17 +1,16 @@
-//NOT COMPLETE
-
 #include <iostream>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 #include <chrono>
 #include <cstdio>
-#include <dirent.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <unistd.h>     // For getcwd() on Linux
+#include <filesystem>   // C++17 filesystem
 #include <getopt.h>
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
+#include <cuda_runtime.h>
 
 using namespace std;
 using namespace cv;
@@ -19,128 +18,287 @@ using namespace chrono;
 
 #define BASE_PATH "./../data/"
 #define CATS_PATH "./../data/cats/"
-#define CATS_PATH_OUTPUT "./../data/Convolution/cats_output/"
+#define CATS_PATH_OUTPUT "./../data/Pooling/cats_output/"
+#define CATS_PATH_FINAL "./../data/Final/cats_final/"
 #define DOGS_PATH "./../data/dogs/"
-#define DOGS_PATH_OUTPUT "./../data/Convolution/dogs_output/"
+#define DOGS_PATH_OUTPUT "./../data/Pooling/dogs_output/"
+#define DOGS_PATH_FINAL "./../data/Final/dogs_final/"
 #define NUM_FILTERS 6
 #define FILTER_SIZE 3
+#define POOLING_SIZE 3
 
-// CUDA kernel for convolution
-__global__ void convolutionKernel(
-    const unsigned char* input,
-    unsigned char* output,
-    const int* filter,
-    int width,
-    int height,
-    int filter_size)
-{
-    // Calculate the row and column index of the output element
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    // Check if the thread is within the valid output region
-    if (row < height - filter_size + 1 && col < width - filter_size + 1) {
-        int sum = 0;
-        
-        // Apply the filter
-        for (int i = 0; i < filter_size; i++) {
-            for (int j = 0; j < filter_size; j++) {
-                int image_value = input[(row + i) * width + (col + j)];
-                int filter_value = filter[i * filter_size + j];
-                sum += image_value * filter_value;
-            }
-        }
-        
-        // Clamp the value to valid range [0, 255]
-        sum = max(0, min(255, sum));
-        
-        // Store the result
-        output[row * (width - filter_size + 1) + col] = static_cast<unsigned char>(sum);
-    }
-}
+// CUDA error checking macro
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error in %s:%d: %s\n", __FILE__, __LINE__, \
+                    cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
 
+// Forward declarations
 void getCurrDir();
-vector<string> getFiles(const string &path);
+vector<filesystem::path> getFiles(const string &path);
 vector<vector<vector<int>>> createFilters();
 bool createDirectory(const string &path);
 
-// CUDA implementation of image convolution
-vector<Mat> conv2D_CUDA(
-    const string &image_path,
-    const vector<vector<vector<int>>> &filters)
+// CUDA kernel for convolution
+__global__ void convKernel(
+        const unsigned char* image,
+        unsigned char* output,
+        const int* filter,
+        int image_width,
+        int image_height,
+        int new_width,
+        int new_height,
+        int filter_size)
 {
-    // Read the image in grayscale
-    Mat image = imread(image_path, IMREAD_GRAYSCALE);
-    vector<Mat> new_images;
-    
-    if (!image.empty()) {
-        // Original image size
-        int image_width = image.cols;
-        int image_height = image.rows;
-        
-        // New image size (after convolution)
-        int new_image_width = image_width - FILTER_SIZE + 1;
-        int new_image_height = image_height - FILTER_SIZE + 1;
-        
-        // Allocate device memory for the input image
-        unsigned char* d_image;
-        cudaMalloc(&d_image, image_width * image_height * sizeof(unsigned char));
-        cudaMemcpy(d_image, image.data, image_width * image_height * sizeof(unsigned char), cudaMemcpyHostToDevice);
-        
-        // Define block and grid dimensions for CUDA kernel
-        dim3 blockDim(16, 16);
-        dim3 gridDim((new_image_width + blockDim.x - 1) / blockDim.x, 
-                     (new_image_height + blockDim.y - 1) / blockDim.y);
-        
-        // Process each filter
-        for (const auto& filter : filters) {
-            // Flatten the 2D filter to 1D for easy transfer to GPU
-            vector<int> flat_filter;
-            for (const auto& row : filter) {
-                for (int val : row) {
-                    flat_filter.push_back(val);
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int filter_idx = blockIdx.z;
+
+    // Make sure we're within bounds
+    if (row < new_height && col < new_width) {
+        int sum = 0;
+
+        // Apply filter at this position
+        for (int i = 0; i < filter_size; i++) {
+            for (int j = 0; j < filter_size; j++) {
+                int image_value = image[(row + i) * image_width + (col + j)];
+                int filter_value = filter[filter_idx * filter_size * filter_size + i * filter_size + j];
+                sum += image_value * filter_value;
+            }
+        }
+
+        // Write output
+        output[filter_idx * new_width * new_height + row * new_width + col] = sum;
+    }
+}
+
+// CUDA kernel for max pooling
+__global__ void maxPoolKernel(
+        const unsigned char* image,
+        unsigned char* output,
+        int image_width,
+        int image_height,
+        int new_width,
+        int new_height,
+        int pooling_size)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Make sure we're within bounds
+    if (row < new_height && col < new_width) {
+        unsigned char maximum = 0;
+
+        int start_row = row * pooling_size;
+        int start_col = col * pooling_size;
+
+        // Find maximum in this pool region
+        for (int i = 0; i < pooling_size; i++) {
+            for (int j = 0; j < pooling_size; j++) {
+                int r = start_row + i;
+                int c = start_col + j;
+
+                if (r < image_height && c < image_width) {
+                    unsigned char pixel = image[r * image_width + c];
+                    if (pixel > maximum) {
+                        maximum = pixel;
+                    }
                 }
             }
-            
-            // Allocate device memory for the filter
-            int* d_filter;
-            cudaMalloc(&d_filter, flat_filter.size() * sizeof(int));
-            cudaMemcpy(d_filter, flat_filter.data(), flat_filter.size() * sizeof(int), cudaMemcpyHostToDevice);
-            
-            // Allocate device memory for the output
-            unsigned char* d_output;
-            cudaMalloc(&d_output, new_image_width * new_image_height * sizeof(unsigned char));
-            
-            // Launch the CUDA kernel for convolution
-            convolutionKernel<<<gridDim, blockDim>>>(
-                d_image,
-                d_output,
-                d_filter,
-                image_width,
-                image_height,
-                FILTER_SIZE
-            );
-            
-            // Synchronize to wait for kernel to finish
-            cudaDeviceSynchronize();
-            
-            // Copy the output back to the host
-            Mat output(new_image_height, new_image_width, CV_8UC1);
-            cudaMemcpy(output.data, d_output, new_image_width * new_image_height * sizeof(unsigned char), cudaMemcpyDeviceToHost);
-            
-            // Add the output to the result vector
-            new_images.push_back(output);
-            
-            // Free device memory for this filter iteration
-            cudaFree(d_filter);
-            cudaFree(d_output);
         }
-        
-        // Free device memory for the input image
-        cudaFree(d_image);
+
+        // Write output
+        output[row * new_width + col] = maximum;
     }
-    
-    return new_images;
+}
+
+// Function to perform convolution using CUDA
+vector<Mat> conv2D_cuda(
+        const string& image_path,
+        const vector<vector<vector<int>>>& filters,
+float& memcpy_time,
+float& kernel_time)
+{
+// Read image
+Mat image = imread(image_path, IMREAD_GRAYSCALE);
+vector<Mat> result_images;
+
+if (image.empty()) {
+return result_images;
+}
+
+// Start timing
+cudaEvent_t start, stop;
+CUDA_CHECK(cudaEventCreate(&start));
+CUDA_CHECK(cudaEventCreate(&stop));
+float elapsed_memcpy = 0;
+float elapsed_kernel = 0;
+
+// Image dimensions
+int image_width = image.cols;
+int image_height = image.rows;
+int new_width = image_width - FILTER_SIZE + 1;
+int new_height = image_height - FILTER_SIZE + 1;
+
+// Allocate host memory for filters
+int* h_filters = new int[NUM_FILTERS * FILTER_SIZE * FILTER_SIZE];
+for (int f = 0; f < NUM_FILTERS; f++) {
+for (int i = 0; i < FILTER_SIZE; i++) {
+for (int j = 0; j < FILTER_SIZE; j++) {
+h_filters[f * FILTER_SIZE * FILTER_SIZE + i * FILTER_SIZE + j] = filters[f][i][j];
+}
+}
+}
+
+// Allocate device memory
+unsigned char* d_image;
+unsigned char* d_output;
+int* d_filters;
+
+CUDA_CHECK(cudaEventRecord(start));
+CUDA_CHECK(cudaMalloc(&d_image, image_width * image_height));
+CUDA_CHECK(cudaMalloc(&d_output, NUM_FILTERS * new_width * new_height));
+CUDA_CHECK(cudaMalloc(&d_filters, NUM_FILTERS * FILTER_SIZE * FILTER_SIZE * sizeof(int)));
+
+// Copy data to device
+CUDA_CHECK(cudaMemcpy(d_image, image.data, image_width * image_height, cudaMemcpyHostToDevice));
+CUDA_CHECK(cudaMemcpy(d_filters, h_filters, NUM_FILTERS * FILTER_SIZE * FILTER_SIZE * sizeof(int), cudaMemcpyHostToDevice));
+CUDA_CHECK(cudaEventRecord(stop));
+CUDA_CHECK(cudaEventSynchronize(stop));
+CUDA_CHECK(cudaEventElapsedTime(&elapsed_memcpy, start, stop));
+memcpy_time += elapsed_memcpy;
+
+// Define block and grid dimensions
+dim3 blockDim(16, 16);
+dim3 gridDim((new_width + blockDim.x - 1) / blockDim.x,
+             (new_height + blockDim.y - 1) / blockDim.y,
+             NUM_FILTERS);
+
+// Launch kernel
+CUDA_CHECK(cudaEventRecord(start));
+convKernel<<<gridDim, blockDim>>>(d_image, d_output, d_filters, image_width, image_height, new_width, new_height, FILTER_SIZE);
+CUDA_CHECK(cudaGetLastError());
+CUDA_CHECK(cudaEventRecord(stop));
+CUDA_CHECK(cudaEventSynchronize(stop));
+CUDA_CHECK(cudaEventElapsedTime(&elapsed_kernel, start, stop));
+kernel_time += elapsed_kernel;
+
+// Allocate host memory for results
+unsigned char* h_output = new unsigned char[NUM_FILTERS * new_width * new_height];
+
+// Copy results back to host
+CUDA_CHECK(cudaEventRecord(start));
+CUDA_CHECK(cudaMemcpy(h_output, d_output, NUM_FILTERS * new_width * new_height, cudaMemcpyDeviceToHost));
+CUDA_CHECK(cudaEventRecord(stop));
+CUDA_CHECK(cudaEventSynchronize(stop));
+float elapsed_temp;
+CUDA_CHECK(cudaEventElapsedTime(&elapsed_temp, start, stop));
+memcpy_time += elapsed_temp;
+
+// Convert back to OpenCV Mat format
+for (int f = 0; f < NUM_FILTERS; f++) {
+Mat new_image(new_height, new_width, CV_8UC1);
+for (int i = 0; i < new_height; i++) {
+for (int j = 0; j < new_width; j++) {
+new_image.at<uchar>(i, j) = h_output[f * new_width * new_height + i * new_width + j];
+}
+}
+result_images.push_back(new_image);
+}
+
+// Free memory
+delete[] h_filters;
+delete[] h_output;
+CUDA_CHECK(cudaFree(d_image));
+CUDA_CHECK(cudaFree(d_output));
+CUDA_CHECK(cudaFree(d_filters));
+
+return result_images;
+}
+
+// Function to perform max pooling using CUDA
+Mat pool2D_max_cuda(const string& image_path, float& memcpy_time, float& kernel_time) {
+    // Read image
+    Mat image = imread(image_path, IMREAD_GRAYSCALE);
+    Mat result_image;
+
+    if (image.empty()) {
+        return result_image;
+    }
+
+    // Start timing
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    float elapsed_memcpy = 0;
+    float elapsed_kernel = 0;
+
+    // Image dimensions
+    int image_width = image.cols;
+    int image_height = image.rows;
+    int new_width = image_width / POOLING_SIZE;
+    int new_height = image_height / POOLING_SIZE;
+
+    // Allocate device memory
+    unsigned char* d_image;
+    unsigned char* d_output;
+
+    CUDA_CHECK(cudaEventRecord(start));
+    CUDA_CHECK(cudaMalloc(&d_image, image_width * image_height));
+    CUDA_CHECK(cudaMalloc(&d_output, new_width * new_height));
+
+    // Copy data to device
+    CUDA_CHECK(cudaMemcpy(d_image, image.data, image_width * image_height, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_memcpy, start, stop));
+    memcpy_time += elapsed_memcpy;
+
+    // Define block and grid dimensions
+    dim3 blockDim(16, 16);
+    dim3 gridDim((new_width + blockDim.x - 1) / blockDim.x,
+                 (new_height + blockDim.y - 1) / blockDim.y);
+
+    // Launch kernel
+    CUDA_CHECK(cudaEventRecord(start));
+    maxPoolKernel<<<gridDim, blockDim>>>(d_image, d_output, image_width, image_height, new_width, new_height, POOLING_SIZE);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_kernel, start, stop));
+    kernel_time += elapsed_kernel;
+
+    // Allocate host memory for results
+    unsigned char* h_output = new unsigned char[new_width * new_height];
+
+    // Copy results back to host
+    CUDA_CHECK(cudaEventRecord(start));
+    CUDA_CHECK(cudaMemcpy(h_output, d_output, new_width * new_height, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    float elapsed_temp;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_temp, start, stop));
+    memcpy_time += elapsed_temp;
+
+    // Convert back to OpenCV Mat format
+    result_image = Mat(new_height, new_width, CV_8UC1);
+    for (int i = 0; i < new_height; i++) {
+        for (int j = 0; j < new_width; j++) {
+            result_image.at<uchar>(i, j) = h_output[i * new_width + j];
+        }
+    }
+
+    // Free memory
+    delete[] h_output;
+    CUDA_CHECK(cudaFree(d_image));
+    CUDA_CHECK(cudaFree(d_output));
+
+    return result_image;
 }
 
 void print_usage(const char *prog_name)
@@ -148,6 +306,21 @@ void print_usage(const char *prog_name)
     cerr << "Usage: " << prog_name << " [-n NUM_IMAGES]" << endl;
     cerr << "Options:" << endl;
     cerr << "  -n NUM_IMAGES  Number of images to process from each category (default: all)" << endl;
+}
+
+// Function to create directory if it doesn't exist
+bool createDirectory(const string &path)
+{
+    try
+    {
+        filesystem::create_directories(path);
+        return true;
+    }
+    catch (const filesystem::filesystem_error &e)
+    {
+        cerr << "Error creating directory: " << e.what() << endl;
+        return false;
+    }
 }
 
 int main(int argc, char *argv[])
@@ -160,49 +333,35 @@ int main(int argc, char *argv[])
     {
         switch (opt)
         {
-        case 'n':
-            num_images = atoi(optarg);
-            if (num_images <= 0)
-            {
-                cerr << "Error: Number of images must be positive" << endl;
+            case 'n':
+                num_images = atoi(optarg);
+                if (num_images <= 0)
+                {
+                    cerr << "Error: Number of images must be positive" << endl;
+                    print_usage(argv[0]);
+                    return 1;
+                }
+                break;
+            default: /* '?' */
                 print_usage(argv[0]);
                 return 1;
-            }
-            break;
-        default: /* '?' */
-            print_usage(argv[0]);
-            return 1;
         }
     }
 
     // Print current working directory
     getCurrDir();
 
-    // Check if CUDA is available
-    int device_count;
-    cudaGetDeviceCount(&device_count);
-    if (device_count == 0) {
-        cerr << "No CUDA devices found. Exiting..." << endl;
-        return 1;
-    }
-    cout << "CUDA device(s) found: " << device_count << endl;
-    
-    // Print CUDA device properties
-    cudaDeviceProp deviceProp;
-    cudaGetDeviceProperties(&deviceProp, 0);
-    cout << "Using CUDA device: " << deviceProp.name << endl;
-    cout << "Compute capability: " << deviceProp.major << "." << deviceProp.minor << endl;
-
     // Ensure output directories exist
-    if (!createDirectory(CATS_PATH_OUTPUT) || !createDirectory(DOGS_PATH_OUTPUT))
+    if (!createDirectory(CATS_PATH_OUTPUT) || !createDirectory(DOGS_PATH_OUTPUT) ||
+        !createDirectory(CATS_PATH_FINAL) || !createDirectory(DOGS_PATH_FINAL))
     {
         cerr << "Error: Could not create output directories" << endl;
         return 1;
     }
 
     // Get all images
-    vector<string> cat_images = getFiles(CATS_PATH);
-    vector<string> dog_images = getFiles(DOGS_PATH);
+    vector<filesystem::path> cat_images = getFiles(CATS_PATH);
+    vector<filesystem::path> dog_images = getFiles(DOGS_PATH);
 
     cout << "Found " << cat_images.size() << " cat images" << endl;
     cout << "Found " << dog_images.size() << " dog images" << endl;
@@ -225,79 +384,99 @@ int main(int argc, char *argv[])
     // Create filters
     vector<vector<vector<int>>> filters = createFilters();
 
-    // Process cat images
+    // Store the output filenames to track which ones to pool later
+    vector<string> processed_cat_filenames;
+    vector<string> processed_dog_filenames;
+
+    // Timing variables
+    float total_memcpy_time = 0.0f;
+    float total_kernel_time = 0.0f;
+
+    // Start overall timing
     auto start = high_resolution_clock::now();
+
+    // Process cat images
     cout << "Processing cat images with CUDA..." << endl;
-
-    for (size_t i = 0; i < cat_images.size(); i++)
-    {
-        // Use CUDA implementation
-        vector<Mat> new_images = conv2D_CUDA(cat_images[i], filters);
-
+    for (size_t i = 0; i < cat_images.size(); i++) {
         // Extract filename from path
-        size_t last_slash = cat_images[i].find_last_of("/\\");
-        string filename = (last_slash == string::npos) ? cat_images[i] : cat_images[i].substr(last_slash + 1);
+        string filename = cat_images[i].filename().string();
+
+        // Perform convolution
+        vector<Mat> new_images = conv2D_cuda(cat_images[i].string(), filters, total_memcpy_time, total_kernel_time);
 
         // Write convolved images to output folder
         int index = 0;
-        for (auto image : new_images)
-        {
-            bool success = imwrite(string(CATS_PATH_OUTPUT) + "filter_" + to_string(index++) + "_" + filename, image);
-            cout << "Cat image " << i + 1 << "/" << cat_images.size() << ", filter " << index << ": Success: " << success << endl;
+        for (auto& image : new_images) {
+            string output_filename = "filter_" + to_string(index++) + "_" + filename;
+            string output_path = string(CATS_PATH_OUTPUT) + output_filename;
+            bool success = imwrite(output_path, image);
+
+            // Store the output filename for later pooling
+            if (success) {
+                processed_cat_filenames.push_back(output_filename);
+            }
         }
     }
 
     // Process dog images
     cout << "Processing dog images with CUDA..." << endl;
-
-    for (size_t i = 0; i < dog_images.size(); i++)
-    {
-        // Use CUDA implementation
-        vector<Mat> new_images = conv2D_CUDA(dog_images[i], filters);
-
+    for (size_t i = 0; i < dog_images.size(); i++) {
         // Extract filename from path
-        size_t last_slash = dog_images[i].find_last_of("/\\");
-        string filename = (last_slash == string::npos) ? dog_images[i] : dog_images[i].substr(last_slash + 1);
+        string filename = dog_images[i].filename().string();
+
+        // Perform convolution
+        vector<Mat> new_images = conv2D_cuda(dog_images[i].string(), filters, total_memcpy_time, total_kernel_time);
 
         // Write convolved images to output folder
         int index = 0;
-        for (auto image : new_images)
-        {
-            bool success = imwrite(string(DOGS_PATH_OUTPUT) + "filter_" + to_string(index++) + "_" + filename, image);
-            cout << "Dog image " << i + 1 << "/" << dog_images.size() << ", filter " << index << ": Success: " << success << endl;
+        for (auto& image : new_images) {
+            string output_filename = "filter_" + to_string(index++) + "_" + filename;
+            string output_path = string(DOGS_PATH_OUTPUT) + output_filename;
+            bool success = imwrite(output_path, image);
+
+            // Store the output filename for later pooling
+            if (success) {
+                processed_dog_filenames.push_back(output_filename);
+            }
         }
     }
 
+    // Pooling for cat images
+    cout << "Pooling cat images with CUDA..." << endl;
+    for (size_t i = 0; i < processed_cat_filenames.size(); i++) {
+        string input_path = string(CATS_PATH_OUTPUT) + processed_cat_filenames[i];
+        Mat new_image = pool2D_max_cuda(input_path, total_memcpy_time, total_kernel_time);
+
+        // Write final images to output folder
+        imwrite(string(CATS_PATH_FINAL) + processed_cat_filenames[i], new_image);
+    }
+
+    // Pooling for dog images
+    cout << "Pooling dog images with CUDA..." << endl;
+    for (size_t i = 0; i < processed_dog_filenames.size(); i++) {
+        string input_path = string(DOGS_PATH_OUTPUT) + processed_dog_filenames[i];
+        Mat new_image = pool2D_max_cuda(input_path, total_memcpy_time, total_kernel_time);
+
+        // Write final images to output folder
+        imwrite(string(DOGS_PATH_FINAL) + processed_dog_filenames[i], new_image);
+    }
+
+    // End timing
     auto end = high_resolution_clock::now();
     auto duration = duration_cast<microseconds>(end - start);
-    cout << "Time taken in seconds: " << duration.count() / 1000000.0 << " seconds" << endl;
 
-    // Clean up CUDA resources
-    cudaDeviceReset();
+    // Output timing information
+    float total_time = duration.count() / 1000000.0;
+    cout << "Total time: " << total_time << ", memcopy: " << total_memcpy_time / 1000.0
+         << ", kernel: " << total_kernel_time / 1000.0 << endl;
 
     return 0;
-}
-
-// Function to create a directory if it doesn't exist
-bool createDirectory(const string &path)
-{
-    struct stat st = {};
-    if (stat(path.c_str(), &st) == -1)
-    {
-        // Directory doesn't exist, create it
-        if (mkdir(path.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) == -1)
-        {
-            perror(("Failed to create directory: " + path).c_str());
-            return false;
-        }
-    }
-    return true;
 }
 
 void getCurrDir()
 {
     char cwd[1024];
-    if (getcwd(cwd, sizeof(cwd)))
+    if (getcwd(cwd, sizeof(cwd)) != nullptr)
     {
         std::cout << "Current working directory: " << cwd << std::endl;
     }
@@ -307,26 +486,12 @@ void getCurrDir()
     }
 }
 
-vector<string> getFiles(const string &path)
+vector<filesystem::path> getFiles(const string &path)
 {
-    vector<string> files;
-    DIR *dir;
-    struct dirent *ent;
-
-    if ((dir = opendir(path.c_str())) != NULL)
+    vector<filesystem::path> files;
+    for (const auto &entry : filesystem::directory_iterator(path))
     {
-        while ((ent = readdir(dir)) != NULL)
-        {
-            if (ent->d_type == DT_REG)
-            { // Regular file
-                files.push_back(path + ent->d_name);
-            }
-        }
-        closedir(dir);
-    }
-    else
-    {
-        perror(("Could not open directory: " + path).c_str());
+        files.push_back(entry.path());
     }
 
     return files;
@@ -335,48 +500,48 @@ vector<string> getFiles(const string &path)
 vector<vector<vector<int>>> createFilters()
 {
     vector<vector<int>> filter_vertical_line{
-        {0, 1, 0},
-        {0, 1, 0},
-        {0, 1, 0},
+            {0, 1, 0},
+            {0, 1, 0},
+            {0, 1, 0},
     };
 
     vector<vector<int>> filter_horiz_line{
-        {0, 0, 0},
-        {1, 1, 1},
-        {0, 0, 0},
+            {0, 0, 0},
+            {1, 1, 1},
+            {0, 0, 0},
     };
 
     vector<vector<int>> filter_diagonal_lbru_line{
-        {0, 0, 1},
-        {0, 1, 0},
-        {1, 0, 0},
+            {0, 0, 1},
+            {0, 1, 0},
+            {1, 0, 0},
     };
 
     vector<vector<int>> filter_diagonal_lurb_line{
-        {1, 0, 0},
-        {0, 1, 0},
-        {0, 0, 1},
+            {1, 0, 0},
+            {0, 1, 0},
+            {0, 0, 1},
     };
 
     vector<vector<int>> filter_diagonal_x_line{
-        {1, 0, 1},
-        {0, 1, 0},
-        {1, 0, 1},
+            {1, 0, 1},
+            {0, 1, 0},
+            {1, 0, 1},
     };
 
     vector<vector<int>> filter_round_line{
-        {0, 1, 0},
-        {1, 0, 1},
-        {0, 1, 0},
+            {0, 1, 0},
+            {1, 0, 1},
+            {0, 1, 0},
     };
 
     vector<vector<vector<int>>> filters{
-        filter_vertical_line,
-        filter_horiz_line,
-        filter_diagonal_lbru_line,
-        filter_diagonal_lurb_line,
-        filter_diagonal_x_line,
-        filter_round_line};
+            filter_vertical_line,
+            filter_horiz_line,
+            filter_diagonal_lbru_line,
+            filter_diagonal_lurb_line,
+            filter_diagonal_x_line,
+            filter_round_line};
 
     return filters;
 }
