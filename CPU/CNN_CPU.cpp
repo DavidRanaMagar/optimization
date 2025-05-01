@@ -1,11 +1,11 @@
 #include <iostream>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 #include <chrono>
 #include <cstdio>
-#include <dirent.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <unistd.h>	  // For getcwd() on Linux
+#include <filesystem> // C++17 filesystem
 #include <getopt.h>
 #include <omp.h>
 
@@ -18,14 +18,17 @@ using namespace chrono;
 
 #define BASE_PATH "./../data/"
 #define CATS_PATH "./../data/cats/"
-#define CATS_PATH_OUTPUT "./../data/Convolution/cats_output/"
+#define CATS_PATH_OUTPUT "./../data/Pooling/cats_output/"
+#define CATS_PATH_FINAL "./../data/Final/cats_final/"
 #define DOGS_PATH "./../data/dogs/"
-#define DOGS_PATH_OUTPUT "./../data/Convolution/dogs_output/"
+#define DOGS_PATH_OUTPUT "./../data/Pooling/dogs_output/"
+#define DOGS_PATH_FINAL "./../data/Final/dogs_final/"
 #define NUM_FILTERS 6
 #define FILTER_SIZE 3
+#define POOLING_SIZE 3
 
 void getCurrDir();
-vector<string> getFiles(const string &path);
+vector<filesystem::path> getFiles(const string &path);
 vector<vector<vector<int>>> createFilters();
 bool createDirectory(const string &path);
 
@@ -41,11 +44,29 @@ vector<Mat> conv2D( // The function takes a vector of filters as a parameter
         const string &,
         const vector<vector<vector<int>>> &);
 
+Mat pool2D_max(const string &);
+// Mat pool2D_avg(const string&);
+
 void print_usage(const char *prog_name)
 {
     cerr << "Usage: " << prog_name << " [-n NUM_IMAGES]" << endl;
     cerr << "Options:" << endl;
     cerr << "  -n NUM_IMAGES  Number of images to process from each category (default: all)" << endl;
+}
+
+// Function to create directory if it doesn't exist
+bool createDirectory(const string &path)
+{
+    try
+    {
+        filesystem::create_directories(path);
+        return true;
+    }
+    catch (const filesystem::filesystem_error &e)
+    {
+        cerr << "Error creating directory: " << e.what() << endl;
+        return false;
+    }
 }
 
 int main(int argc, char *argv[])
@@ -77,15 +98,15 @@ int main(int argc, char *argv[])
     getCurrDir();
 
     // Ensure output directories exist
-    if (!createDirectory(CATS_PATH_OUTPUT) || !createDirectory(DOGS_PATH_OUTPUT))
+    if (!createDirectory(CATS_PATH_OUTPUT) || !createDirectory(DOGS_PATH_OUTPUT) || !createDirectory(CATS_PATH_FINAL))
     {
         cerr << "Error: Could not create output directories" << endl;
         return 1;
     }
 
     // Get all images
-    vector<string> cat_images = getFiles(CATS_PATH);
-    vector<string> dog_images = getFiles(DOGS_PATH);
+    vector<filesystem::path> cat_images = getFiles(CATS_PATH);
+    vector<filesystem::path> dog_images = getFiles(DOGS_PATH);
 
     cout << "Found " << cat_images.size() << " cat images" << endl;
     cout << "Found " << dog_images.size() << " dog images" << endl;
@@ -145,15 +166,17 @@ int main(int argc, char *argv[])
     // Create filters (actual use, for conv2D)
     vector<vector<vector<int>>> filters = createFilters();
 
-    // Process cat images
+    // Store the output filenames to track which ones to pool later
+    vector<string> processed_cat_filenames;
+
+    // Convolution for cat images
     auto start = high_resolution_clock::now();
-    cout << "Processing cat images..." << endl;
-// commit below line for native no optimization
 #pragma omp parallel for // OpenMP can run this loop 10X faster
     for (size_t i = 0; i < cat_images.size(); i++)
     {
         // The function that takes static filters as parameters
-        vector<Mat> new_images = conv2D_static(cat_images[i],
+        // This one runs much faster than the one that takes a vector of filters as a parameter
+        vector<Mat> new_images = conv2D_static(cat_images[i].string(),
                                                filter_vertical_line,
                                                filter_horiz_line,
                                                filter_diagonal_lbru_line,
@@ -162,26 +185,37 @@ int main(int argc, char *argv[])
                                                filter_round_line);
 
         // Extract filename from path
-        size_t last_slash = cat_images[i].find_last_of("/\\");
-        string filename = (last_slash == string::npos) ? cat_images[i] : cat_images[i].substr(last_slash + 1);
+        string filename = cat_images[i].filename().string();
 
         // Write convolved images to output folder
         int index = 0;
         for (auto image : new_images)
         {
-            bool success = imwrite(string(CATS_PATH_OUTPUT) + "filter_" + to_string(index++) + "_" + filename, image);
-            cout << "Cat image " << i + 1 << "/" << cat_images.size() << ", filter " << index << ": Success: " << success << endl;
+            string output_filename = "filter_" + to_string(index++) + "_" + filename;
+            string output_path = string(CATS_PATH_OUTPUT) + output_filename;
+            bool success = imwrite(output_path, image);
+            // cout << "Cat image " << i + 1 << "/" << cat_images.size() << ", filter " << index << ": Success: " << success << endl;
+
+            // Store the output filename for later pooling
+            if (success)
+            {
+#pragma omp critical
+                {
+                    processed_cat_filenames.push_back(output_filename);
+                }
+            }
         }
     }
 
     // Process dog images
     cout << "Processing dog images..." << endl;
-// commit below line for native no optimization
+    vector<string> processed_dog_filenames;
+
 #pragma omp parallel for // OpenMP can run this loop 10X faster
     for (size_t i = 0; i < dog_images.size(); i++)
     {
         // The function that takes static filters as parameters
-        vector<Mat> new_images = conv2D_static(dog_images[i],
+        vector<Mat> new_images = conv2D_static(dog_images[i].string(),
                                                filter_vertical_line,
                                                filter_horiz_line,
                                                filter_diagonal_lbru_line,
@@ -190,45 +224,71 @@ int main(int argc, char *argv[])
                                                filter_round_line);
 
         // Extract filename from path
-        size_t last_slash = dog_images[i].find_last_of("/\\");
-        string filename = (last_slash == string::npos) ? dog_images[i] : dog_images[i].substr(last_slash + 1);
+        string filename = dog_images[i].filename().string();
 
         // Write convolved images to output folder
         int index = 0;
         for (auto image : new_images)
         {
-            bool success = imwrite(string(DOGS_PATH_OUTPUT) + "filter_" + to_string(index++) + "_" + filename, image);
-            cout << "Dog image " << i + 1 << "/" << dog_images.size() << ", filter " << index << ": Success: " << success << endl;
+            string output_filename = "filter_" + to_string(index++) + "_" + filename;
+            string output_path = string(DOGS_PATH_OUTPUT) + output_filename;
+            bool success = imwrite(output_path, image);
+            // cout << "Dog image " << i + 1 << "/" << dog_images.size() << ", filter " << index << ": Success: " << success << endl;
+
+            // Store the output filename for later pooling (if needed)
+            if (success)
+            {
+#pragma omp critical
+                {
+                    processed_dog_filenames.push_back(output_filename);
+                }
+            }
         }
     }
 
     auto end = high_resolution_clock::now();
-    auto duration = duration_cast<microseconds>(end - start);
-    cout << "Time taken in seconds: " << duration.count() / 1000000.0 << " seconds" << endl;
+    auto duration_cov = duration_cast<microseconds>(end - start);
+    cout << "Time taken by convolution: " << duration_cov.count() / 1000000.0 << " seconds" << endl;
 
-    return 0;
-}
+    // Pooling - only for the cat images we processed
+    cout << "Pooling cat images..." << endl;
+    start = high_resolution_clock::now();
 
-// Function to create a directory if it doesn't exist
-bool createDirectory(const string &path)
-{
-    struct stat st = {};
-    if (stat(path.c_str(), &st) == -1)
+    for (size_t i = 0; i < processed_cat_filenames.size(); i++)
     {
-        // Directory doesn't exist, create it
-        if (mkdir(path.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) == -1)
-        {
-            perror(("Failed to create directory: " + path).c_str());
-            return false;
-        }
+        string input_path = string(CATS_PATH_OUTPUT) + processed_cat_filenames[i];
+        Mat new_image = pool2D_max(input_path);
+
+        // Write final images to output folder
+        bool success = imwrite(string(CATS_PATH_FINAL) + processed_cat_filenames[i], new_image);
+        // cout << "Pooling image " << i + 1 << "/" << processed_cat_filenames.size() << ": Success: " << success << endl;
     }
-    return true;
+
+    cout << "Pooling dog images..." << endl;
+
+    for (size_t i = 0; i < processed_dog_filenames.size(); i++)
+    {
+        string input_path = string(DOGS_PATH_OUTPUT) + processed_dog_filenames[i];
+        Mat new_image = pool2D_max(input_path);
+
+        // Write final images to output folder
+        bool success = imwrite(string(DOGS_PATH_FINAL) + processed_dog_filenames[i], new_image);
+        // cout << "Pooling dog image " << i + 1 << "/" << processed_dog_filenames.size() << ": Success: " << success << endl;
+    }
+
+    end = high_resolution_clock::now();
+    auto duration_pol = duration_cast<microseconds>(end - start);
+
+    cout << "Time taken by pooling: " << duration_pol.count() / 1000000.0 << " seconds" << endl;
+    auto duration = duration_cov+duration_pol;
+    cout << "Total Time: " << duration.count() / 1000000.0 << " seconds" << endl;
+    return 0;
 }
 
 void getCurrDir()
 {
     char cwd[1024];
-    if (getcwd(cwd, sizeof(cwd)))
+    if (getcwd(cwd, sizeof(cwd)) != nullptr)
     {
         std::cout << "Current working directory: " << cwd << std::endl;
     }
@@ -238,26 +298,12 @@ void getCurrDir()
     }
 }
 
-vector<string> getFiles(const string &path)
+vector<filesystem::path> getFiles(const string &path)
 {
-    vector<string> files;
-    DIR *dir;
-    struct dirent *ent;
-
-    if ((dir = opendir(path.c_str())) != NULL)
+    vector<filesystem::path> files;
+    for (const auto &entry : filesystem::directory_iterator(path))
     {
-        while ((ent = readdir(dir)) != NULL)
-        {
-            if (ent->d_type == DT_REG)
-            { // Regular file
-                files.push_back(path + ent->d_name);
-            }
-        }
-        closedir(dir);
-    }
-    else
-    {
-        perror(("Could not open directory: " + path).c_str());
+        files.push_back(entry.path());
     }
 
     return files;
@@ -328,8 +374,11 @@ vector<Mat> conv2D_static(
         int image_width = image.cols;
         int image_height = image.rows;
 
-        int new_image_width = image_width - FILTER_SIZE;
-        int new_image_height = image_height - FILTER_SIZE;
+        /*cout << "Image width: " << image_width << endl;
+        cout << "Image height: " << image_height << endl;*/
+
+        int new_image_width = image_width - FILTER_SIZE + 1;
+        int new_image_height = image_height - FILTER_SIZE + 1;
 
         Mat new_image_extract_vertical = Mat::zeros(new_image_height, new_image_width, CV_8UC1);
         Mat new_image_extract_horiz = Mat::zeros(new_image_height, new_image_width, CV_8UC1);
@@ -409,8 +458,8 @@ int image_width = image.cols;
 int image_height = image.rows;
 
 // New image size
-int new_image_width = image_width - FILTER_SIZE;
-int new_image_height = image_height - FILTER_SIZE;
+int new_image_width = image_width - FILTER_SIZE + 1;
+int new_image_height = image_height - FILTER_SIZE + 1;
 
 // Init the vector to store the new images
 vector<Mat> new_images;
@@ -462,4 +511,61 @@ return new_images;
 
 vector<Mat> new_images;
 return new_images;
+}
+
+Mat pool2D_max(const string &image_path)
+{
+    Mat image = imread(image_path, IMREAD_GRAYSCALE);
+
+    if (!image.empty())
+    {
+        // Original image size
+        int image_width = image.cols;
+        int image_height = image.rows;
+
+        // New image size
+        int new_image_width = image_width / POOLING_SIZE;
+        int new_image_height = image_height / POOLING_SIZE;
+
+        // Init the new image
+        Mat new_image = Mat::zeros(new_image_height, new_image_width, CV_8UC1);
+
+        // Loop for each pixel of new image
+        for (int i = 0; i < new_image_height; i++)
+        {
+            for (int j = 0; j < new_image_width; j++)
+            {
+                // Find the left upper point in original image
+                int corner_i = i * POOLING_SIZE;
+                int corner_j = j * POOLING_SIZE;
+
+                // Initialize the maximum to int_min
+                int maximum = INT_MIN;
+
+                // Loop and find the maximum
+                for (int pool_i = corner_i; pool_i < corner_i + POOLING_SIZE; pool_i++)
+                {
+                    for (int pool_j = corner_j; pool_j < corner_j + POOLING_SIZE; pool_j++)
+                    {
+                        // The value of the pixel of original image
+                        int image_value = image.at<uchar>(pool_i, pool_j);
+
+                        // Find maximum
+                        if (image_value > maximum)
+                        {
+                            maximum = image_value;
+                        }
+                    }
+                }
+
+                // Save the calculated new pixel to new image
+                new_image.at<uchar>(i, j) = maximum;
+            }
+        }
+
+        return new_image;
+    }
+
+    Mat new_image;
+    return new_image;
 }

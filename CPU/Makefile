@@ -5,10 +5,10 @@ CPPFLAGS := $(shell pkg-config --cflags opencv4)
 LDFLAGS := $(shell pkg-config --libs opencv4) -fopenmp
 
 # Target executable
-TARGET := Convolution_CPU
+TARGET := CNN_CPU
 
 # Source files
-SRCS := Convolution_CPU.cpp
+SRCS := CNN_CPU.cpp
 
 # Object files
 OBJS := $(SRCS:.cpp=.o)
@@ -27,7 +27,7 @@ $(TARGET): $(OBJS)
 # Clean up
 clean:
 	rm -f $(TARGET) $(OBJS)
-	rm -rf ../data/Convolution/cats_output ../data/Convolution/dogs_output
+	rm  -rf ../data/CPU/cats_output ../data/CPU/dogs_output ../data/CPU/Final/cats_final ../data/CPU/Final/dogs_final
 
 # Run with all images
 run:
@@ -53,8 +53,10 @@ test:
 
 # Create output directories
 create-dirs:
-	mkdir -p ../data/Convolution/cats_output
-	mkdir -p ../data/Convolution/dogs_output
+	mkdir -p ../data/CPU/cats_output
+	mkdir -p ../data/CPU/dogs_output
+	mkdir -p ../data/CPU/Final/dogs_final
+	mkdir -p ../data/CPU/Final/cats_final
 
 # Install required dependencies (for Ubuntu)
 install-deps:
