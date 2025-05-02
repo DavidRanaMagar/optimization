@@ -1,78 +1,115 @@
-# Compiler and flags
-CXX := g++
-CXXFLAGS := -std=c++17 -fopenmp -O3 -Wall -Wextra -Wsign-compare
-CPPFLAGS := $(shell pkg-config --cflags opencv4)
-LDFLAGS := $(shell pkg-config --libs opencv4) -fopenmp
+# Cross-platform Makefile for CNN_CPU
 
-# Target executable
-TARGET := CNN_CPU
+# Detect operating system
+ifeq ($(OS),Windows_NT)
+    DETECTED_OS := Windows
+    EXE_EXT := .exe
+    RM_CMD := del /Q
+    RM_DIR_CMD := rmdir /S /Q
+    MKDIR_CMD := mkdir
+    
+    # Check for MinGW or MSYS2
+    ifneq (,$(findstring MINGW,$(shell uname -s)))
+        CC := g++
+        RM_CMD := rm -f
+        RM_DIR_CMD := rm -rf
+        MKDIR_CMD := mkdir -p
+    else
+        CC := g++
+    endif
+else
+    DETECTED_OS := $(shell uname -s)
+    EXE_EXT :=
+    RM_CMD := rm -f
+    RM_DIR_CMD := rm -rf
+    MKDIR_CMD := mkdir -p
+    CC := g++
+endif
+
+# Output binary name
+TARGET := CNN_CPU$(EXE_EXT)
 
 # Source files
-SRCS := CNN_CPU.cpp
+SOURCES := CNN_CPU.cpp
+
+# OpenCV configuration
+ifeq ($(DETECTED_OS),Windows)
+    OPENCV_DIR := C:/opencv/build
+    OPENCV_INCLUDE := -I$(OPENCV_DIR)/include
+    OPENCV_LIBS := -L$(OPENCV_DIR)/x64/mingw/lib \
+                   -lopencv_core455 -lopencv_imgproc455 -lopencv_imgcodecs455 -lopencv_highgui455
+else
+    OPENCV_INCLUDE := $(shell pkg-config --cflags opencv4 2>/dev/null)
+    OPENCV_LIBS := $(shell pkg-config --libs opencv4 2>/dev/null)
+    
+    ifeq ($(OPENCV_INCLUDE),)
+        OPENCV_INCLUDE := $(shell pkg-config --cflags opencv 2>/dev/null)
+        OPENCV_LIBS := $(shell pkg-config --libs opencv 2>/dev/null)
+    endif
+    
+    ifeq ($(OPENCV_INCLUDE),)
+        OPENCV_INCLUDE := -I/usr/include/opencv4
+        OPENCV_LIBS := -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_highgui
+    endif
+endif
+
+# Compiler flags
+CXXFLAGS := -std=c++11 -Wall -Wextra -O2 $(OPENCV_INCLUDE)
+LDFLAGS := $(OPENCV_LIBS)
 
 # Object files
-OBJS := $(SRCS:.cpp=.o)
+OBJECTS := $(SOURCES:.cpp=.o)
+
+# Output directory to clean
+# Output directory to clean - platform specific
+ifeq ($(DETECTED_OS),Windows)
+    OUTPUT_DIR := ..\data\cpu_output
+    # For Windows rmdir command, we need to add quotes for paths with spaces
+    CLEAN_OUTPUT_CMD := if exist "$(OUTPUT_DIR)" $(RM_DIR_CMD) "$(OUTPUT_DIR)"
+else
+    OUTPUT_DIR := ../data/cpu_output
+    CLEAN_OUTPUT_CMD := $(RM_DIR_CMD) $(OUTPUT_DIR)
+endif
+
 
 # Default target
 all: $(TARGET)
 
-# Link object files to create executable
-$(TARGET): $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
-
-# Compile source files to object files
+# Pattern rule for object files
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c $< -o $@
+	@echo "Compiling $<..."
+	$(CC) $(CXXFLAGS) -c $< -o $@
 
-# Clean up
+# Linking
+$(TARGET): $(OBJECTS)
+	@echo "Linking $@..."
+	$(CC) $^ -o $@ $(LDFLAGS)
+	@echo "Build successful!"
+
+# Run target
+run: $(TARGET)
+	@echo "Running $(TARGET)..."
+	@./$(TARGET)
+
 clean:
-	rm -f $(TARGET) $(OBJS)
-	rm  -rf ../data/CPU/cats_output ../data/CPU/dogs_output ../data/CPU/Final/cats_final ../data/CPU/Final/dogs_final
+	@echo "Cleaning build files..."
+	$(RM_CMD) $(OBJECTS) $(TARGET)
+	@echo "Cleaning output directory..."
+	$(RM_DIR_CMD) $(OUTPUT_DIR)
+	@echo "Clean complete."
 
-# Run with all images
-run:
-	./$(TARGET)
+config:
+	@echo "Detected OS: $(DETECTED_OS)"
+	@echo "Compiler: $(CC)"
+	@echo "OpenCV Include: $(OPENCV_INCLUDE)"
+	@echo "OpenCV Libraries: $(OPENCV_LIBS)"
 
-# Handle 'make run #' where # is a number
-ifneq ($(filter run,$(MAKECMDGOALS)),)
-  # Get the number argument (the first non-run argument)
-  NUM_ARG := $(firstword $(filter-out run,$(MAKECMDGOALS)))
-  ifneq ($(NUM_ARG),)
-    # If we got a number, use it
-    .PHONY: run$(NUM_ARG)
-    run$(NUM_ARG):
-		@:
-    run: run$(NUM_ARG)
-		./$(TARGET) -n $(NUM_ARG)
-  endif
-endif
-
-# Quick test with 2 images
-test:
-	./$(TARGET) -n 2
-
-# Create output directories
-create-dirs:
-	mkdir -p ../data/CPU/cats_output
-	mkdir -p ../data/CPU/dogs_output
-	mkdir -p ../data/CPU/Final/dogs_final
-	mkdir -p ../data/CPU/Final/cats_final
-
-# Install required dependencies (for Ubuntu)
-install-deps:
-	sudo apt-get update
-	sudo apt-get install -y g++ libomp-dev libopencv-dev pkg-config
-
-# Show help
 help:
 	@echo "Available targets:"
-	@echo "  all          - Build the executable (default)"
-	@echo "  clean        - Remove executable and object files"
-	@echo "  run          - Run with all images"
-	@echo "  run 4        - Run with 4 images (replace 4 with any number)"
-	@echo "  test         - Quick test with 2 images"
-	@echo "  create-dirs  - Create output directories"
-	@echo "  install-deps - Install required dependencies (Ubuntu only)"
-	@echo "  help         - Show this help message"
+	@echo "  all      - Build the application (default)"
+	@echo "  run      - Build and run the application"
+	@echo "  clean    - Remove build files and output directory"
+	@echo "  config   - Show build configuration"
+	@echo "  help     - Show this help message"
 
-.PHONY: all clean run test create-dirs install-deps help
+.PHONY: all clean config help run

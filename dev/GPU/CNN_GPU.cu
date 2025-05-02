@@ -16,13 +16,9 @@ using namespace std;
 using namespace cv;
 using namespace chrono;
 
-#define BASE_PATH "./../data/"
-#define CATS_PATH "./../data/cats/"
-#define CATS_PATH_OUTPUT "./../data/Pooling/cats_output/"
-#define CATS_PATH_FINAL "./../data/Final/cats_final/"
-#define DOGS_PATH "./../data/dogs/"
-#define DOGS_PATH_OUTPUT "./../data/Pooling/dogs_output/"
-#define DOGS_PATH_FINAL "./../data/Final/dogs_final/"
+#define IMG_PATH "./../../data/images/"
+#define IMG_CONV_OUTPUT "./../../data/dev/gpu/Conv/"
+#define IMG_PATH_FINAL "./../../data/dev/gpu/Final/"
 #define NUM_FILTERS 6
 #define FILTER_SIZE 3
 #define POOLING_SIZE 3
@@ -352,41 +348,33 @@ int main(int argc, char *argv[])
     getCurrDir();
 
     // Ensure output directories exist
-    if (!createDirectory(CATS_PATH_OUTPUT) || !createDirectory(DOGS_PATH_OUTPUT) ||
-        !createDirectory(CATS_PATH_FINAL) || !createDirectory(DOGS_PATH_FINAL))
+    if (!createDirectory(IMG_CONV_OUTPUT) ||
+        !createDirectory(IMG_PATH_FINAL))
     {
         cerr << "Error: Could not create output directories" << endl;
         return 1;
     }
 
     // Get all images
-    vector<filesystem::path> cat_images = getFiles(CATS_PATH);
-    vector<filesystem::path> dog_images = getFiles(DOGS_PATH);
+    vector<filesystem::path> images = getFiles(IMG_PATH);
 
-    cout << "Found " << cat_images.size() << " cat images" << endl;
-    cout << "Found " << dog_images.size() << " dog images" << endl;
+    cout << "Found " << images.size() << " images" << endl;
 
     // Limit the number of images if specified
     if (num_images > 0)
     {
-        if (static_cast<size_t>(num_images) < cat_images.size())
+        if (static_cast<size_t>(num_images) < images.size())
         {
-            cat_images.resize(num_images);
+            images.resize(num_images);
         }
-        if (static_cast<size_t>(num_images) < dog_images.size())
-        {
-            dog_images.resize(num_images);
-        }
-        cout << "Processing " << cat_images.size() << " cat images and "
-             << dog_images.size() << " dog images" << endl;
+        cout << "Processing " << images.size() << " images and " << endl;
     }
 
     // Create filters
     vector<vector<vector<int>>> filters = createFilters();
 
     // Store the output filenames to track which ones to pool later
-    vector<string> processed_cat_filenames;
-    vector<string> processed_dog_filenames;
+    vector<string> processed_filenames;
 
     // Timing variables
     float total_memcpy_time = 0.0f;
@@ -395,70 +383,38 @@ int main(int argc, char *argv[])
     // Start overall timing
     auto start = high_resolution_clock::now();
 
-    // Process cat images
-    cout << "Processing cat images with CUDA..." << endl;
-    for (size_t i = 0; i < cat_images.size(); i++) {
+    // Process images
+    cout << "Processing images with CUDA..." << endl;
+    for (size_t i = 0; i < images.size(); i++) {
         // Extract filename from path
-        string filename = cat_images[i].filename().string();
+        string filename = images[i].filename().string();
 
         // Perform convolution
-        vector<Mat> new_images = conv2D_cuda(cat_images[i].string(), filters, total_memcpy_time, total_kernel_time);
+        vector<Mat> new_images = conv2D_cuda(images[i].string(), filters, total_memcpy_time, total_kernel_time);
 
         // Write convolved images to output folder
         int index = 0;
         for (auto& image : new_images) {
             string output_filename = "filter_" + to_string(index++) + "_" + filename;
-            string output_path = string(CATS_PATH_OUTPUT) + output_filename;
+            string output_path = string(IMG_CONV_OUTPUT) + output_filename;
             bool success = imwrite(output_path, image);
 
             // Store the output filename for later pooling
             if (success) {
-                processed_cat_filenames.push_back(output_filename);
+                processed_filenames.push_back(output_filename);
             }
         }
     }
 
-    // Process dog images
-    cout << "Processing dog images with CUDA..." << endl;
-    for (size_t i = 0; i < dog_images.size(); i++) {
-        // Extract filename from path
-        string filename = dog_images[i].filename().string();
 
-        // Perform convolution
-        vector<Mat> new_images = conv2D_cuda(dog_images[i].string(), filters, total_memcpy_time, total_kernel_time);
-
-        // Write convolved images to output folder
-        int index = 0;
-        for (auto& image : new_images) {
-            string output_filename = "filter_" + to_string(index++) + "_" + filename;
-            string output_path = string(DOGS_PATH_OUTPUT) + output_filename;
-            bool success = imwrite(output_path, image);
-
-            // Store the output filename for later pooling
-            if (success) {
-                processed_dog_filenames.push_back(output_filename);
-            }
-        }
-    }
-
-    // Pooling for cat images
-    cout << "Pooling cat images with CUDA..." << endl;
-    for (size_t i = 0; i < processed_cat_filenames.size(); i++) {
-        string input_path = string(CATS_PATH_OUTPUT) + processed_cat_filenames[i];
+    // Pooling for images
+    cout << "Pooling images with CUDA..." << endl;
+    for (size_t i = 0; i < processed_filenames.size(); i++) {
+        string input_path = string(IMG_CONV_OUTPUT) + processed_filenames[i];
         Mat new_image = pool2D_max_cuda(input_path, total_memcpy_time, total_kernel_time);
 
         // Write final images to output folder
-        imwrite(string(CATS_PATH_FINAL) + processed_cat_filenames[i], new_image);
-    }
-
-    // Pooling for dog images
-    cout << "Pooling dog images with CUDA..." << endl;
-    for (size_t i = 0; i < processed_dog_filenames.size(); i++) {
-        string input_path = string(DOGS_PATH_OUTPUT) + processed_dog_filenames[i];
-        Mat new_image = pool2D_max_cuda(input_path, total_memcpy_time, total_kernel_time);
-
-        // Write final images to output folder
-        imwrite(string(DOGS_PATH_FINAL) + processed_dog_filenames[i], new_image);
+        imwrite(string(IMG_PATH_FINAL) + processed_filenames[i], new_image);
     }
 
     // End timing
