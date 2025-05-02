@@ -29,20 +29,10 @@ using namespace chrono;
 
 void getCurrDir();
 vector<filesystem::path> getFiles(const string &path);
-vector<vector<vector<int>>> createFilters();
 bool createDirectory(const string &path);
 
-vector<Mat> conv2D_static(const string &, // This function takes static filters as parameters
-                          const vector<vector<int>>,
-                          const vector<vector<int>>,
-                          const vector<vector<int>>,
-                          const vector<vector<int>>,
-                          const vector<vector<int>>,
-                          const vector<vector<int>>);
+vector<Mat> conv2D(const string &);
 
-vector<Mat> conv2D( // The function takes a vector of filters as a parameter
-        const string &,
-        const vector<vector<vector<int>>> &);
 
 Mat pool2D_max(const string &);
 // Mat pool2D_avg(const string&);
@@ -126,63 +116,16 @@ int main(int argc, char *argv[])
              << dog_images.size() << " dog images" << endl;
     }
 
-    // Create filters (test use, for conv2D_static)
-    vector<vector<int>> filter_vertical_line{
-            {0, 1, 0},
-            {0, 1, 0},
-            {0, 1, 0},
-    };
-
-    vector<vector<int>> filter_horiz_line{
-            {0, 0, 0},
-            {1, 1, 1},
-            {0, 0, 0},
-    };
-
-    vector<vector<int>> filter_diagonal_lbru_line{
-            {0, 0, 1},
-            {0, 1, 0},
-            {1, 0, 0},
-    };
-
-    vector<vector<int>> filter_diagonal_lurb_line{
-            {1, 0, 0},
-            {0, 1, 0},
-            {0, 0, 1},
-    };
-
-    vector<vector<int>> filter_diagonal_x_line{
-            {1, 0, 1},
-            {0, 1, 0},
-            {1, 0, 1},
-    };
-
-    vector<vector<int>> filter_round_line{
-            {0, 1, 0},
-            {1, 0, 1},
-            {0, 1, 0},
-    };
-
-    // Create filters (actual use, for conv2D)
-    vector<vector<vector<int>>> filters = createFilters();
-
-    // Store the output filenames to track which ones to pool later
     vector<string> processed_cat_filenames;
 
     // Convolution for cat images
     auto start = high_resolution_clock::now();
-#pragma omp parallel for // OpenMP can run this loop 10X faster
+// #pragma omp parallel for // OpenMP can run this loop 10X faster
     for (size_t i = 0; i < cat_images.size(); i++)
     {
         // The function that takes static filters as parameters
         // This one runs much faster than the one that takes a vector of filters as a parameter
-        vector<Mat> new_images = conv2D_static(cat_images[i].string(),
-                                               filter_vertical_line,
-                                               filter_horiz_line,
-                                               filter_diagonal_lbru_line,
-                                               filter_diagonal_lurb_line,
-                                               filter_diagonal_x_line,
-                                               filter_round_line);
+        vector<Mat> new_images = conv2D(cat_images[i].string());
 
         // Extract filename from path
         string filename = cat_images[i].filename().string();
@@ -199,7 +142,7 @@ int main(int argc, char *argv[])
             // Store the output filename for later pooling
             if (success)
             {
-#pragma omp critical
+// #pragma omp critical
                 {
                     processed_cat_filenames.push_back(output_filename);
                 }
@@ -211,17 +154,11 @@ int main(int argc, char *argv[])
     cout << "Processing dog images..." << endl;
     vector<string> processed_dog_filenames;
 
-#pragma omp parallel for // OpenMP can run this loop 10X faster
+// #pragma omp parallel for // OpenMP can run this loop 10X faster
     for (size_t i = 0; i < dog_images.size(); i++)
     {
         // The function that takes static filters as parameters
-        vector<Mat> new_images = conv2D_static(dog_images[i].string(),
-                                               filter_vertical_line,
-                                               filter_horiz_line,
-                                               filter_diagonal_lbru_line,
-                                               filter_diagonal_lurb_line,
-                                               filter_diagonal_x_line,
-                                               filter_round_line);
+        vector<Mat> new_images = conv2D(dog_images[i].string());
 
         // Extract filename from path
         string filename = dog_images[i].filename().string();
@@ -238,7 +175,7 @@ int main(int argc, char *argv[])
             // Store the output filename for later pooling (if needed)
             if (success)
             {
-#pragma omp critical
+// #pragma omp critical
                 {
                     processed_dog_filenames.push_back(output_filename);
                 }
@@ -309,64 +246,16 @@ vector<filesystem::path> getFiles(const string &path)
     return files;
 }
 
-vector<vector<vector<int>>> createFilters()
+
+vector<Mat> conv2D(
+        const string &image_path)
 {
-    vector<vector<int>> filter_vertical_line{
-            {0, 1, 0},
-            {0, 1, 0},
-            {0, 1, 0},
-    };
-
-    vector<vector<int>> filter_horiz_line{
-            {0, 0, 0},
-            {1, 1, 1},
-            {0, 0, 0},
-    };
-
-    vector<vector<int>> filter_diagonal_lbru_line{
-            {0, 0, 1},
-            {0, 1, 0},
-            {1, 0, 0},
-    };
-
-    vector<vector<int>> filter_diagonal_lurb_line{
-            {1, 0, 0},
-            {0, 1, 0},
-            {0, 0, 1},
-    };
-
-    vector<vector<int>> filter_diagonal_x_line{
-            {1, 0, 1},
-            {0, 1, 0},
-            {1, 0, 1},
-    };
-
-    vector<vector<int>> filter_round_line{
-            {0, 1, 0},
-            {1, 0, 1},
-            {0, 1, 0},
-    };
-
-    vector<vector<vector<int>>> filters{
-            filter_vertical_line,
-            filter_horiz_line,
-            filter_diagonal_lbru_line,
-            filter_diagonal_lurb_line,
-            filter_diagonal_x_line,
-            filter_round_line};
-
-    return filters;
-}
-
-vector<Mat> conv2D_static(
-        const string &image_path,
-        const vector<vector<int>> filter_vertical_line,
-        const vector<vector<int>> filter_horizontal_line,
-        const vector<vector<int>> filter_diagonal_lbru_line,
-        const vector<vector<int>> filter_diagonal_lurb_line,
-        const vector<vector<int>> filter_diagonal_x_line,
-        const vector<vector<int>> filter_round_line)
-{
+    vector<vector<int>> filter_vertical_line{{0, 1, 0},{0, 1, 0},{0, 1, 0}};
+    vector<vector<int>> filter_horizontal_line{{0, 0, 0},{1, 1, 1},{0, 0, 0},};
+    vector<vector<int>> filter_diagonal_lbru_line{{0, 0, 1},{0, 1, 0},{1, 0, 0}};
+    vector<vector<int>> filter_diagonal_lurb_line{{1, 0, 0},{0, 1, 0},{0, 0, 1}};
+    vector<vector<int>> filter_diagonal_x_line{{1, 0, 1},{0, 1, 0},{1, 0, 1}};
+    vector<vector<int>> filter_round_line{{0, 1, 0},{1, 0, 1},{0, 1, 0}};
     Mat image = imread(image_path, IMREAD_GRAYSCALE);
 
     if (!image.empty())
@@ -374,8 +263,8 @@ vector<Mat> conv2D_static(
         int image_width = image.cols;
         int image_height = image.rows;
 
-        /*cout << "Image width: " << image_width << endl;
-        cout << "Image height: " << image_height << endl;*/
+        // cout << "Image width: " << image_width << endl;
+        // cout << "Image height: " << image_height << endl;
 
         int new_image_width = image_width - FILTER_SIZE + 1;
         int new_image_height = image_height - FILTER_SIZE + 1;
@@ -447,71 +336,6 @@ vector<Mat> conv2D_static(
     return new_images;
 }
 
-vector<Mat> conv2D(const string &image_path, const vector<vector<vector<int>>> &filters)
-{
-Mat image = imread(image_path, IMREAD_GRAYSCALE);
-
-if (!image.empty())
-{
-// Original image size
-int image_width = image.cols;
-int image_height = image.rows;
-
-// New image size
-int new_image_width = image_width - FILTER_SIZE + 1;
-int new_image_height = image_height - FILTER_SIZE + 1;
-
-// Init the vector to store the new images
-vector<Mat> new_images;
-for (int i = 0; i < NUM_FILTERS; i++)
-{
-new_images.push_back(Mat::zeros(new_image_height, new_image_width, CV_8UC1));
-}
-
-// Loop for each pixel of new image
-for (int i = 0; i < new_image_height; i++)
-{
-for (int j = 0; j < new_image_width; j++)
-{
-// Init vector to store the value of this pixel of each filter
-vector<int> pixel_sum;
-for (int pixel = 0; pixel < NUM_FILTERS; pixel++)
-{
-pixel_sum.push_back(0);
-}
-
-for (int filter_i = i; filter_i < i + FILTER_SIZE; filter_i++)
-{
-for (int filter_j = j; filter_j < j + FILTER_SIZE; filter_j++)
-{
-// The value of the pixel of original image
-int image_value = image.at<uchar>(filter_i, filter_j);
-
-// Loop each filter
-for (size_t filter = 0; filter < filters.size(); filter++)
-{
-int filter_value = filters[filter][filter_i - i][filter_j - j];
-int filter_sum = image_value * filter_value;
-
-pixel_sum[filter] += filter_sum;
-}
-}
-}
-
-// Save the calculated new pixel to new images
-for (size_t image = 0; image < new_images.size(); image++)
-{
-new_images[image].at<uchar>(i, j) = pixel_sum[image];
-}
-}
-}
-
-return new_images;
-}
-
-vector<Mat> new_images;
-return new_images;
-}
 
 Mat pool2D_max(const string &image_path)
 {
