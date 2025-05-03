@@ -1,54 +1,205 @@
 #include <iostream>
-#include <vector>
 #include <string>
+#include <vector>
 #include <chrono>
-#include <opencv2/opencv.hpp>
+#include <cstdio>
+#include <filesystem> // C++17 filesystem
+#include <getopt.h>
 
-// Cross-platform filesystem handling
-#if defined(_WIN32) || defined(_WIN64)
-#include <direct.h>
-    #include <windows.h>
+// OpenCV includes
+#include <opencv2/opencv.hpp>
+#include <opencv2/highgui.hpp>
+
+// Platform-specific includes
+#ifdef _WIN32
+#include <direct.h>  // For _getcwd on Windows
+    #define GETCWD _getcwd
     #define PATH_SEPARATOR "\\"
-    #define MKDIR(dir) _mkdir(dir)
 #else
-#include <sys/stat.h>
-#include <dirent.h>
-#include <unistd.h>
+#include <unistd.h>  // For getcwd on Linux/Unix
+#define GETCWD getcwd
 #define PATH_SEPARATOR "/"
-#define MKDIR(dir) mkdir(dir, 0755)
 #endif
 
-using namespace cv;
 using namespace std;
-using namespace std::chrono;
+using namespace cv;
+using namespace chrono;
+namespace fs = std::filesystem;
 
-// Configurations
-const int NUM_FILTERS = 6;
-const int FILTER_SIZE = 3;
-const int POOLING_SIZE = 3;
+// Cross-platform path definitions
+#define IMG_PATH ".." PATH_SEPARATOR "data" PATH_SEPARATOR "images" PATH_SEPARATOR
+#define IMG_PATH_FINAL ".." PATH_SEPARATOR "data" PATH_SEPARATOR "cpu_output" PATH_SEPARATOR
 
-// Function to normalize matrix to 0-255 range
-Mat normalizeMatrix(const Mat &input)
+#define NUM_FILTERS 6
+#define FILTER_SIZE 3
+#define POOLING_SIZE 3
+
+// Function declarations
+string getCurrDir();
+vector<fs::path> getFiles(const string &path);
+bool createDirectory(const string &path);
+vector<Mat> conv2D(const string &);
+Mat pool2D_max(const Mat &);
+
+void print_usage(const char *prog_name)
 {
-    Mat normalized;
-    double minVal, maxVal;
-    minMaxLoc(input, &minVal, &maxVal);
-
-    if (maxVal == minVal)
-    {
-        return Mat::zeros(input.size(), CV_8UC1);
-    }
-
-    input.convertTo(normalized, CV_8UC1, 255.0 / (maxVal - minVal), -minVal * 255.0 / (maxVal - minVal));
-    return normalized;
+    cerr << "Usage: " << prog_name << " [-n NUM_IMAGES]" << endl;
+    cerr << "Options:" << endl;
+    cerr << "  -n NUM_IMAGES  Number of images to process from each category (default: all)" << endl;
 }
 
-Mat applyConvAndPool(const Mat &image)
+// Cross-platform directory creation
+bool createDirectory(const string &path)
 {
-    if (image.empty())
+    try
     {
-        return Mat();
+        fs::create_directories(path);
+        return true;
     }
+    catch (const fs::filesystem_error &e)
+    {
+        cerr << "Error creating directory: " << e.what() << endl;
+        return false;
+    }
+}
+
+// Cross-platform argument parsing
+int parseArgs(int argc, char *argv[])
+{
+    int num_images = -1;
+    int opt;
+
+#ifdef _WIN32
+    // Simple command-line parsing for Windows
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            num_images = atoi(argv[i + 1]);
+            if (num_images <= 0) {
+                cerr << "Error: Number of images must be positive" << endl;
+                print_usage(argv[0]);
+                return -1;
+            }
+            break;
+        }
+    }
+#else
+    // Use getopt for Unix/Linux
+    while ((opt = getopt(argc, argv, "n:")) != -1)
+    {
+        switch (opt)
+        {
+            case 'n':
+                num_images = atoi(optarg);
+                if (num_images <= 0)
+                {
+                    cerr << "Error: Number of images must be positive" << endl;
+                    print_usage(argv[0]);
+                    return -1;
+                }
+                break;
+            default:
+                print_usage(argv[0]);
+                return -1;
+        }
+    }
+#endif
+
+    return num_images;
+}
+
+int main(int argc, char *argv[])
+{
+    // Parse command line arguments
+    int num_images = parseArgs(argc, argv);
+    if (num_images == -1 && argc > 1) {
+        return 1;
+    }
+
+    // Display current directory
+    cout << "Current working directory: " << getCurrDir() << endl;
+
+    // Create output directory
+    if (!createDirectory(IMG_PATH_FINAL))
+    {
+        cerr << "Error: Could not create output directories" << endl;
+        return 1;
+    }
+
+    // Get image files
+    vector<fs::path> images;
+    try {
+        images = getFiles(IMG_PATH);
+        cout << "Found " << images.size() << " images" << endl;
+    }
+    catch (const exception& e) {
+        cerr << "Error accessing image directory: " << e.what() << endl;
+        cerr << "Make sure the directory " << IMG_PATH << " exists" << endl;
+        return 1;
+    }
+
+    // Limit number of images if specified
+    if (num_images > 0)
+    {
+        if (static_cast<size_t>(num_images) < images.size())
+        {
+            images.resize(num_images);
+        }
+        cout << "Processing " << images.size() << " images" << endl;
+    }
+
+    // Process images
+    auto start = high_resolution_clock::now();
+
+    for (size_t i = 0; i < images.size(); i++)
+    {
+        vector<Mat> new_images = conv2D(images[i].string());
+        string filename = images[i].filename().string();
+
+        if (!new_images.empty()) {
+            Mat last_convolved = new_images.back(); // Gets the last image
+            Mat pooled_image = pool2D_max(last_convolved);
+
+            string output_filename = "final_" + filename;
+            imwrite(string(IMG_PATH_FINAL) + output_filename, pooled_image);
+        }
+    }
+
+    auto end = high_resolution_clock::now();
+    auto duration_pol = duration_cast<milliseconds>(end - start);
+
+    cout << "Time taken: " << duration_pol.count() << " ms" << endl;
+    return 0;
+}
+
+// Cross-platform get current directory
+string getCurrDir()
+{
+    char cwd[1024];
+    if (GETCWD(cwd, sizeof(cwd)) != nullptr)
+    {
+        return string(cwd);
+    }
+    else
+    {
+        cerr << "Failed to get current working directory." << endl;
+        return "";
+    }
+}
+
+// Get files from directory
+vector<fs::path> getFiles(const string &path)
+{
+    vector<fs::path> files;
+    for (const auto &entry : fs::directory_iterator(path))
+    {
+        files.push_back(entry.path());
+    }
+    return files;
+}
+
+// Image convolution
+vector<Mat> conv2D(const string &image_path)
+{
     vector<vector<int>> filter_vertical_line{{0, 1, 0}, {0, 1, 0}, {0, 1, 0}};
     vector<vector<int>> filter_horizontal_line{{0, 0, 0},{1, 1, 1},{0, 0, 0}};
     vector<vector<int>> filter_diagonal_lbru_line{{0, 0, 1}, {0, 1, 0}, {1, 0, 0}};
@@ -56,209 +207,106 @@ Mat applyConvAndPool(const Mat &image)
     vector<vector<int>> filter_diagonal_x_line{{1, 0, 1}, {0, 1, 0}, {1, 0, 1}};
     vector<vector<int>> filter_round_line{{0, 1, 0}, {1, 0, 1}, {0, 1, 0}};
 
-    int image_width = image.cols;
-    int image_height = image.rows;
+    Mat image = imread(image_path, IMREAD_GRAYSCALE);
 
-    int new_image_width = image_width - FILTER_SIZE + 1;
-    int new_image_height = image_height - FILTER_SIZE + 1;
-
-    Mat convolved = Mat::zeros(new_image_height, new_image_width, CV_8UC1);
-
-    for (int i = 0; i < new_image_height; i++)
+    if (!image.empty())
     {
-        for (int j = 0; j < new_image_width; j++)
+        int image_width = image.cols;
+        int image_height = image.rows;
+
+        int new_image_width = image_width - FILTER_SIZE + 1;
+        int new_image_height = image_height - FILTER_SIZE + 1;
+
+        Mat new_image_extract_vertical = Mat::zeros(new_image_height, new_image_width, CV_8UC1);
+        Mat new_image_extract_horiz = Mat::zeros(new_image_height, new_image_width, CV_8UC1);
+        Mat new_image_extract_diagonal_lbru = Mat::zeros(new_image_height, new_image_width, CV_8UC1);
+        Mat new_image_extract_diagonal_lurb = Mat::zeros(new_image_height, new_image_width, CV_8UC1);
+        Mat new_image_extract_diagonal_x = Mat::zeros(new_image_height, new_image_width, CV_8UC1);
+        Mat new_image_extract_round = Mat::zeros(new_image_height, new_image_width, CV_8UC1);
+
+        for (int i = 0; i < new_image_height; i++)
         {
-            int round_sum = 0;
-
-            for (int filter_i = i; filter_i < i + FILTER_SIZE; filter_i++)
+            for (int j = 0; j < new_image_width; j++)
             {
-                for (int filter_j = j; filter_j < j + FILTER_SIZE; filter_j++)
+                int vertical_sum = 0;
+                int horiz_sum = 0;
+                int diagonal_lbru_sum = 0;
+                int diagonal_lurb_sum = 0;
+                int diagonal_x_sum = 0;
+                int round_sum = 0;
+
+                for (int filter_i = i; filter_i < i + FILTER_SIZE; filter_i++)
                 {
-                    int image_value = image.at<uchar>(filter_i, filter_j);
-                    int filter_value = filter_round_line[filter_i - i][filter_j - j];
-                    round_sum += image_value * filter_value;
-                }
-            }
-            convolved.at<uchar>(i, j) = round_sum;
-        }
-    }
+                    for (int filter_j = j; filter_j < j + FILTER_SIZE; filter_j++)
+                    {
+                        int image_value = image.at<uchar>(filter_i, filter_j);
 
-    // Step 2: Max Pooling
-    int pooledWidth = convolved.cols / POOLING_SIZE;
-    int pooledHeight = convolved.rows / POOLING_SIZE;
-    Mat pooledResult = Mat::zeros(pooledHeight, pooledWidth, CV_8UC1);
-
-    for (int i = 0; i < pooledHeight; i++) {
-        for (int j = 0; j < pooledWidth; j++) {
-            uchar maxVal = 0;
-            int startY = i * POOLING_SIZE;
-            int startX = j * POOLING_SIZE;
-
-            for (int y = startY; y < startY + POOLING_SIZE && y < convolved.rows; y++) {
-                for (int x = startX; x < startX + POOLING_SIZE && x < convolved.cols; x++) {
-                    maxVal = max(maxVal, convolved.at<uchar>(y, x));
-                }
-            }
-            pooledResult.at<uchar>(i, j) = maxVal;
-        }
-    }
-
-    return pooledResult;
-}
-
-// Cross-platform directory creation
-bool createDirectory(const string &path)
-{
-    return MKDIR(path.c_str()) == 0 || errno == EEXIST;
-}
-
-// Cross-platform file listing
-vector<string> getImageFiles(const string &directory)
-{
-    vector<string> imageFiles;
-
-#if defined(_WIN32) || defined(_WIN64)
-    WIN32_FIND_DATA fileData;
-    HANDLE hFind;
-    string searchPattern = directory + PATH_SEPARATOR + "*";
-    
-    hFind = FindFirstFile(searchPattern.c_str(), &fileData);
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            if (!(fileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                string filename = fileData.cFileName;
-                string ext = filename.substr(filename.find_last_of(".") + 1);
-                transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                
-                if (ext == "jpg" || ext == "jpeg" || ext == "png") {
-                    imageFiles.push_back(directory + PATH_SEPARATOR + filename);
-                }
-            }
-        } while (FindNextFile(hFind, &fileData));
-        FindClose(hFind);
-    }
-#else
-    DIR *dir;
-    struct dirent *ent;
-
-    if ((dir = opendir(directory.c_str())) != NULL) {
-        while ((ent = readdir(dir)) != NULL) {
-            string filename = ent->d_name;
-
-            // Skip directories
-            struct stat s;
-            string fullpath = directory + PATH_SEPARATOR + filename;
-            if (stat(fullpath.c_str(), &s) == 0 && !S_ISDIR(s.st_mode)) {
-                if (filename.length() > 4) {
-                    string ext = filename.substr(filename.find_last_of(".") + 1);
-                    transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-
-                    if (ext == "jpg" || ext == "jpeg" || ext == "png") {
-                        imageFiles.push_back(fullpath);
+                        vertical_sum += image_value * filter_vertical_line[filter_i - i][filter_j - j];
+                        horiz_sum += image_value * filter_horizontal_line[filter_i - i][filter_j - j];
+                        diagonal_lbru_sum += image_value * filter_diagonal_lbru_line[filter_i - i][filter_j - j];
+                        diagonal_lurb_sum += image_value * filter_diagonal_lurb_line[filter_i - i][filter_j - j];
+                        diagonal_x_sum += image_value * filter_diagonal_x_line[filter_i - i][filter_j - j];
+                        round_sum += image_value * filter_round_line[filter_i - i][filter_j - j];
                     }
                 }
+
+                new_image_extract_vertical.at<uchar>(i, j) = vertical_sum;
+                new_image_extract_horiz.at<uchar>(i, j) = horiz_sum;
+                new_image_extract_diagonal_lbru.at<uchar>(i, j) = diagonal_lbru_sum;
+                new_image_extract_diagonal_lurb.at<uchar>(i, j) = diagonal_lurb_sum;
+                new_image_extract_diagonal_x.at<uchar>(i, j) = diagonal_x_sum;
+                new_image_extract_round.at<uchar>(i, j) = round_sum;
             }
         }
-        closedir(dir);
-    }
-#endif
 
-    return imageFiles;
+        return {new_image_extract_vertical, new_image_extract_horiz,
+                new_image_extract_diagonal_lbru, new_image_extract_diagonal_lurb,
+                new_image_extract_diagonal_x, new_image_extract_round};
+    }
+
+    return {};
 }
 
-// Cross-platform filename extraction
-string getFilename(const string &path)
+// Pooling operation
+Mat pool2D_max(const Mat &image)
 {
-    size_t sepPos = path.find_last_of("/\\");
-    if (sepPos != string::npos) {
-        return path.substr(sepPos + 1);
-    }
-    return path;
-}
-
-int main()
-{
-    // Start total processing timer
-    auto total_start = high_resolution_clock::now();
-
-    // Cross-platform path construction
-    string inputDir = ".." + string(PATH_SEPARATOR) + "data" + string(PATH_SEPARATOR) + "images";
-    string outputDir = ".." + string(PATH_SEPARATOR) + "data" + string(PATH_SEPARATOR) + "cpu_output";
-
-    // Create output directory if it doesn't exist
-    if (!createDirectory(outputDir))
+    if (!image.empty())
     {
-        cerr << "Error: Could not create output directory!" << endl;
-        return -1;
-    }
+        int image_width = image.cols;
+        int image_height = image.rows;
 
-    // Get all image files in the input directory
-    vector<string> imageFiles = getImageFiles(inputDir);
+        int new_image_width = image_width / POOLING_SIZE;
+        int new_image_height = image_height / POOLING_SIZE;
 
-    if (imageFiles.empty())
-    {
-        cerr << "Error: No image files found in " << inputDir << endl;
-        return -1;
-    }
+        Mat new_image = Mat::zeros(new_image_height, new_image_width, CV_8UC1);
 
-    // Initialize counters and timers
-    int processed_count = 0;
-    int failed_count = 0;
-    long long total_processing_time = 0;
-
-    cout << "Starting processing of " << imageFiles.size() << " images..." << endl;
-
-    // Process each image
-    for (const auto &imagePath : imageFiles)
-    {
-        auto image_start = high_resolution_clock::now();
-
-        // Load image
-        Mat image = imread(imagePath, IMREAD_GRAYSCALE);
-        if (image.empty())
+        for (int i = 0; i < new_image_height; i++)
         {
-            cerr << "Warning: Could not load image " << imagePath << " - skipping" << endl;
-            failed_count++;
-            continue;
+            for (int j = 0; j < new_image_width; j++)
+            {
+                int corner_i = i * POOLING_SIZE;
+                int corner_j = j * POOLING_SIZE;
+
+                int maximum = INT_MIN;
+
+                for (int pool_i = corner_i; pool_i < corner_i + POOLING_SIZE && pool_i < image_height; pool_i++)
+                {
+                    for (int pool_j = corner_j; pool_j < corner_j + POOLING_SIZE && pool_j < image_width; pool_j++)
+                    {
+                        int image_value = image.at<uchar>(pool_i, pool_j);
+                        if (image_value > maximum)
+                        {
+                            maximum = image_value;
+                        }
+                    }
+                }
+
+                new_image.at<uchar>(i, j) = maximum;
+            }
         }
 
-        // Process image
-        Mat result = applyConvAndPool(image);
-        if (result.empty())
-        {
-            cerr << "Warning: Processing failed for " << imagePath << " - skipping" << endl;
-            failed_count++;
-            continue;
-        }
-
-        // Create output filename - cross-platform way
-        string filename = getFilename(imagePath);
-        string outputPath = outputDir + PATH_SEPARATOR + "final_" + filename;
-
-        // Save result
-        if (!imwrite(outputPath, result))
-        {
-            cerr << "Warning: Failed to save " << outputPath << endl;
-            failed_count++;
-            continue;
-        }
-
-        auto image_end = high_resolution_clock::now();
-        auto image_duration = duration_cast<milliseconds>(image_end - image_start);
-        total_processing_time += image_duration.count();
-        processed_count++;
+        return new_image;
     }
 
-    auto total_end = high_resolution_clock::now();
-    auto total_duration = duration_cast<milliseconds>(total_end - total_start);
-
-    // Print summary
-    cout << "\nProcessing complete!" << endl;
-    cout << "=================================" << endl;
-    cout << "Total images processed: " << processed_count << endl;
-    cout << "Failed to process: " << failed_count << endl;
-    cout << "Total processing time: " << total_duration.count() << " ms" << endl;
-    cout << "=================================" << endl;
-
-    return 0;
+    return Mat();
 }
