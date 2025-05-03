@@ -1,8 +1,12 @@
 # Compiler and flags
-CXX := g++
-CXXFLAGS := -std=c++17 -fopenmp -O3 -Wall -Wextra -Wsign-compare
+CXX := clang++
+CXXFLAGS := -std=c++17 -Xpreprocessor -fopenmp -O3 -Wall -Wextra -Wsign-compare
 CPPFLAGS := $(shell pkg-config --cflags opencv4)
-LDFLAGS := $(shell pkg-config --libs opencv4) -fopenmp
+# Updated LDFLAGS to include correct OpenMP path
+LDFLAGS := $(shell pkg-config --libs opencv4) -L/opt/homebrew/opt/libomp/lib -lomp
+
+# For Intel Macs, use this instead:
+# LDFLAGS := $(shell pkg-config --libs opencv4) -L/usr/local/opt/libomp/lib -lomp
 
 # Target executable
 TARGET := CNN_CPU
@@ -27,7 +31,9 @@ $(TARGET): $(OBJS)
 # Clean up
 clean:
 	rm -f $(TARGET) $(OBJS)
-	rm  -rf ../../data/dev/cpu
+	rm -rf ../../data/dev/cpu
+
+# [Rest of your Makefile remains the same...]
 
 # Run with all images
 run:
@@ -53,13 +59,27 @@ test:
 
 # Create output directories
 create-dirs:
-	mkdir -p ../../data/dev/cpu/Final 
+	mkdir -p ../../data/dev/cpu/Final
 	mkdir -p ../../data/dev/cpu/Conv
 
-# Install required dependencies (for Ubuntu)
+# Install required dependencies (for macOS using Homebrew)
 install-deps:
-	sudo apt-get update
-	sudo apt-get install -y g++ libomp-dev libopencv-dev pkg-config
+	# Install Homebrew if not already installed
+	@if ! command -v brew &> /dev/null; then \
+		/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; \
+		echo 'eval "$$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zshrc; \
+		source ~/.zshrc; \
+	fi
+
+	# Install required packages
+	brew update
+	brew install llvm libomp opencv pkg-config
+
+	# Set environment variables for llvm
+	@echo "You may need to add these to your shell configuration:"
+	@echo 'export PATH="/opt/homebrew/opt/llvm/bin:$$PATH"'
+	@echo 'export LDFLAGS="-L/opt/homebrew/opt/llvm/lib"'
+	@echo 'export CPPFLAGS="-I/opt/homebrew/opt/llvm/include"'
 
 # Show help
 help:
@@ -70,7 +90,7 @@ help:
 	@echo "  run 4        - Run with 4 images (replace 4 with any number)"
 	@echo "  test         - Quick test with 2 images"
 	@echo "  create-dirs  - Create output directories"
-	@echo "  install-deps - Install required dependencies (Ubuntu only)"
+	@echo "  install-deps - Install required dependencies (macOS only)"
 	@echo "  help         - Show this help message"
 
 .PHONY: all clean run test create-dirs install-deps help
