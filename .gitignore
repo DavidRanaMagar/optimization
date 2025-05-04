@@ -6,3 +6,11 @@
 *.fatbin
 /data
 .vscode
+
+*.exe
+*.lib
+*.obj
+*.exp
+*.ilk
+*.pdb
+*.png
