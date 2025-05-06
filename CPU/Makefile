@@ -27,7 +27,7 @@ $(TARGET): $(OBJS)
 # Clean up
 clean:
 	rm -f $(TARGET) $(OBJS)
-	rm  -rf ../../data/dev/cpu
+	rm  -rf ../../data/cpu_output
 
 # Run with all images
 run:
