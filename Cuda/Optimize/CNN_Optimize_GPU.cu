@@ -13,8 +13,8 @@
 #define POOL_SIZE 3
 
 // Paths for input images and final output directory
-#define IMG_PATH "../../../data/images/"
-#define IMG_PATH_FINAL "../../../data/gpu_optimal_output/"
+#define IMG_PATH "../../data/images/"
+#define IMG_PATH_FINAL "../../data/gpu_optimal_output/"
 
 // Filter stored in GPU constant memory (flattened 1D array)
 __constant__ int d_filter[FILTER_SIZE * FILTER_SIZE];
