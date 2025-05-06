@@ -1,250 +1,385 @@
-/*
- * CPU implementation of simple convolutional neural network operations:
- *  - Applies six 3x3 filters (edge detectors and pattern detectors) to grayscale images.
- *  - Performs max-pooling with a 3x3 window on the final convolved feature map.
- *  - Processes all images found in the input directory and saves the results to an output directory.
- *  - Measures and reports total processing time.
- *
- * Usage:
- *   ./program [-n NUM_IMAGES]
- *   -n NUM_IMAGES : Limit the number of images to process (default: all images).
- *
- * Input Path:
- *   Defined by IMG_PATH (e.g., "data/images/")
- * Output Path:
- *   Defined by IMG_PATH_FINAL (e.g., "data/gpu_naive_output/")
- *
- * Dependencies:
- *   - C++17 <filesystem> for directory operations
- *   - OpenCV for image loading and saving
- *   - Cross-platform support for getcwd and getopt/_getcwd
- */
+#include <iostream>
+#include <vector>
+#include <string>
+#include <chrono>
+#include <cuda_runtime.h>
 
-#include <iostream>  // Basic I/O operations
-#include <string>    // std::string class
-#include <vector>    // std::vector container
-#include <chrono>    // Timing utilities
-#include <filesystem> // C++17 filesystem for directory operations
-#include <cstring>   // strcmp for command-line parsing
-#include <cstdlib>   // atoi for string to integer conversion
-
-#include <opencv2/opencv.hpp>  // OpenCV includes for image processing
-
+// Cross-platform includes and definitions
 #ifdef _WIN32
-#include <direct.h>  // For _getcwd on Windows
- #define GETCWD _getcwd
+#include <direct.h>
+    #define MKDIR(dir) _mkdir(dir)
+    #define PATH_SEPARATOR "\\"
 #else
-#include <getopt.h>  // getopt for Unix/Linux argument parsing
-#include <unistd.h>  // For getcwd on Linux/Unix
-#define GETCWD getcwd
+#include <sys/stat.h>
+#include <sys/types.h>
+#define MKDIR(dir) mkdir(dir, 0755)
+#define PATH_SEPARATOR "/"
 #endif
 
-using namespace std;
+// OpenCV includes with minimal dependencies
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/highgui.hpp>
+
+// Use C++17 filesystem if available, otherwise fallback
+#if __cplusplus >= 201703L || (defined(_MSVC_LANG) && _MSVC_LANG >= 201703L)
+#include <filesystem>
+    namespace fs = std::filesystem;
+    #define HAS_FILESYSTEM 1
+#else
+#define HAS_FILESYSTEM 0
+// Simple directory entry for fallback implementation
+struct DirectoryEntry {
+    std::string path;
+    bool is_regular_file() const { return true; } // Simplified
+    std::string extension() const {
+        size_t pos = path.find_last_of('.');
+        return (pos != std::string::npos) ? path.substr(pos) : "";
+    }
+};
+#endif
+
 using namespace cv;
-using namespace chrono;
-namespace fs = std::filesystem;
+using namespace std;
+using namespace std::chrono;
 
-// Cross-platform default paths
-#define IMG_PATH "../../../data/images/"     // Input images directory
-#define IMG_PATH_FINAL "../../../data/gpu_naive_output/"      // Output images directory
+// Configurations
+const int NUM_FILTERS = 6;
+const int FILTER_SIZE = 3;
+const int POOLING_SIZE = 3;
 
-#define FILTER_SIZE 3     // Convolution filter size (3x3)
-#define POOLING_SIZE 3    // Max-pooling window size (3x3)
-
-// Function declarations
-string getCurrDir();                              // Retrieve current working directory
-vector<fs::path> getFiles(const string &path);    // List files in a directory
-bool createDirectory(const string &path);          // Create a directory (including parents)
-int parseArgs(int argc, char *argv[]);             // Parse command-line arguments
-vector<Mat> conv2D(const string &image_path);     // Perform 2D convolution with six filters
-Mat pool2D_max(const Mat &image);                 // Perform max-pooling on a single image
-
-// Print program usage instructions
-void print_usage(const char *prog_name)
-{
-    cerr << "Usage: " << prog_name << " [-n NUM_IMAGES]" << endl;
-    cerr << "  -n NUM_IMAGES : Number of images to process (default: all)" << endl;
-}
-
-// Create directory (including parent directories) in a cross-platform way
-bool createDirectory(const string &path)
-{
-    try {
-        fs::create_directories(path);
-        return true;
-    } catch (const fs::filesystem_error &e) {
-        cerr << "Error creating directory: " << e.what() << endl;
-        return false;
+// CUDA error checking macro
+#define CHECK_CUDA_ERROR(val) check((val), #val, __FILE__, __LINE__)
+template <typename T>
+void check(T err, const char* const func, const char* const file, const int line) {
+    if (err != cudaSuccess) {
+        cerr << "CUDA Runtime Error at: " << file << ":" << line << endl;
+        cerr << cudaGetErrorString(err) << " " << func << endl;
+        exit(1);
     }
 }
 
-// Parse command-line arguments to get optional number of images to process
-int parseArgs(int argc, char *argv[])
-{
-    int num_images = -1;  // Default: process all images
-    int opt;
-#ifdef _WIN32
-    // Windows: simple manual parsing
-     for (int i = 1; i < argc; i++) {
-         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
-             num_images = atoi(argv[i + 1]);
-             if (num_images <= 0) {
-                 cerr << "Error: Number of images must be positive" << endl;
-                 print_usage(argv[0]);
-                 return -1;
-             }
-             break;
-         }
-     }
+// Store filter in constant memory for faster access
+__constant__ int filter_round_line[3][3] = {{0, 1, 0}, {1, 0, 1}, {0, 1, 0}};
+
+// Kernel for convolution operation
+__global__ void convolutionKernel(const unsigned char* input, unsigned char* output,
+                                  int width, int height, int filterSize) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x < width - filterSize + 1 && y < height - filterSize + 1) {
+        int sum = 0;
+        for (int i = 0; i < filterSize; i++) {
+            for (int j = 0; j < filterSize; j++) {
+                int image_value = input[(y + i) * width + (x + j)];
+                int filter_value = filter_round_line[i][j];
+                sum += image_value * filter_value;
+            }
+        }
+        output[y * (width - filterSize + 1) + x] = static_cast<unsigned char>(sum);
+    }
+}
+
+// Kernel for max pooling operation
+__global__ void maxPoolingKernel(const unsigned char* input, unsigned char* output,
+                                 int width, int height, int poolingSize) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    int pooledWidth = width / poolingSize;
+    int pooledHeight = height / poolingSize;
+
+    if (x < pooledWidth && y < pooledHeight) {
+        unsigned char maxVal = 0;
+        int startX = x * poolingSize;
+        int startY = y * poolingSize;
+
+        for (int i = startY; i < startY + poolingSize && i < height; i++) {
+            for (int j = startX; j < startX + poolingSize && j < width; j++) {
+                maxVal = (input[i * width + j] > maxVal) ? input[i * width + j] : maxVal;
+            }
+        }
+        output[y * pooledWidth + x] = maxVal;
+    }
+}
+
+// Cross-platform directory creation function
+bool createDirectory(const string& path) {
+    if (path.empty()) return false;
+
+#if HAS_FILESYSTEM
+    try {
+            return fs::create_directories(path);
+        } catch (const fs::filesystem_error& e) {
+            cerr << "Error creating directory: " << e.what() << endl;
+            return false;
+        }
 #else
-    // Unix/Linux: use getopt for robust parsing
-    while ((opt = getopt(argc, argv, "n:")) != -1) {
-        switch (opt) {
-            case 'n':
-                num_images = atoi(optarg);
-                if (num_images <= 0) {
-                    cerr << "Error: Number of images must be positive" << endl;
-                    print_usage(argv[0]);
-                    return -1;
-                }
-                break;
-            default:
-                print_usage(argv[0]);
-                return -1;
-        }
-    }
+    return MKDIR(path.c_str()) == 0;
 #endif
-    return num_images;
 }
 
-int main(int argc, char *argv[])
-{
-    int num_images = parseArgs(argc, argv);
-    if (num_images == -1 && argc > 1) return 1;
+// Cross-platform directory existence check
+bool directoryExists(const string& path) {
+#if HAS_FILESYSTEM
+    return fs::exists(path) && fs::is_directory(path);
+#else
+    struct stat info;
+    return stat(path.c_str(), &info) == 0 && (info.st_mode & S_IFDIR);
+#endif
+}
 
-    cout << "Current working directory: " << getCurrDir() << endl;
+// Cross-platform function to get file extension in lowercase
+string getFileExtension(const string& filename) {
+    size_t dotPos = filename.find_last_of('.');
+    if (dotPos == string::npos) return "";
 
-    if (!createDirectory(IMG_PATH_FINAL)) {
-        cerr << "Error: Could not create output directory" << endl;
-        return 1;
-    }
+    string ext = filename.substr(dotPos);
+    for (char& c : ext) c = tolower(c);
+    return ext;
+}
 
-    vector<fs::path> images;
+// Cross-platform function to get filename from path
+string getFilenameFromPath(const string& filepath) {
+    size_t lastSeparator = filepath.find_last_of("/\\");
+    return (lastSeparator == string::npos) ? filepath : filepath.substr(lastSeparator + 1);
+}
+
+// Get image files from a directory
+vector<string> getImageFiles(const string& directory) {
+    vector<string> imageFiles;
+
+#if HAS_FILESYSTEM
     try {
-        images = getFiles(IMG_PATH);
-        cout << "Found " << images.size() << " images" << endl;
-    } catch (const exception &e) {
-        cerr << "Error accessing image directory: " << e.what() << endl;
-        cerr << "Ensure directory exists: " << IMG_PATH << endl;
-        return 1;
+            for (const auto& entry : fs::directory_iterator(directory)) {
+                if (fs::is_regular_file(entry.path())) {
+                    string ext = entry.path().extension().string();
+                    transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                    if (ext == ".jpg" || ext == ".jpeg" || ext == ".png") {
+                        imageFiles.push_back(entry.path().string());
+                    }
+                }
+            }
+        } catch (const fs::filesystem_error& e) {
+            cerr << "Error accessing directory: " << e.what() << endl;
+        }
+#else
+    // Simplified implementation - would need platform-specific code for actual use
+    cerr << "Warning: C++17 filesystem not supported. Please implement a directory listing function for your platform." << endl;
+    // Here you would use platform-specific code (e.g., FindFirstFile/FindNextFile on Windows,
+    // opendir/readdir on POSIX systems) to list directory contents
+#endif
+
+    return imageFiles;
+}
+
+Mat applyConvAndPoolCUDA(const Mat &image) {
+    if (image.empty()) {
+        return Mat();
     }
 
-    if (num_images > 0 && static_cast<size_t>(num_images) < images.size()) {
-        images.resize(num_images);
-        cout << "Processing " << images.size() << " images" << endl;
+    // Allocate device memory
+    unsigned char *d_input, *d_convolved, *d_pooled;
+    int width = image.cols;
+    int height = image.rows;
+
+    size_t inputSize = width * height * sizeof(unsigned char);
+    size_t convOutputSize = (width - FILTER_SIZE + 1) * (height - FILTER_SIZE + 1) * sizeof(unsigned char);
+
+    CHECK_CUDA_ERROR(cudaMalloc(&d_input, inputSize));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_convolved, convOutputSize));
+
+    // Copy input to device
+    CHECK_CUDA_ERROR(cudaMemcpy(d_input, image.data, inputSize, cudaMemcpyHostToDevice));
+
+    // Configure kernel launch parameters for convolution
+    dim3 blockDim(32, 32);
+    dim3 gridDim((width - FILTER_SIZE + 1 + blockDim.x - 1) / blockDim.x,
+                 (height - FILTER_SIZE + 1 + blockDim.y - 1) / blockDim.y);
+
+    // Launch convolution kernel
+    convolutionKernel<<<gridDim, blockDim>>>(d_input, d_convolved, width, height, FILTER_SIZE);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+
+    // Configure kernel launch parameters for pooling
+    int pooledWidth = (width - FILTER_SIZE + 1) / POOLING_SIZE;
+    int pooledHeight = (height - FILTER_SIZE + 1) / POOLING_SIZE;
+    size_t pooledSize = pooledWidth * pooledHeight * sizeof(unsigned char);
+
+    CHECK_CUDA_ERROR(cudaMalloc(&d_pooled, pooledSize));
+
+    dim3 poolBlockDim(32, 32);
+    dim3 poolGridDim((pooledWidth + poolBlockDim.x - 1) / poolBlockDim.x,
+                     (pooledHeight + poolBlockDim.y - 1) / poolBlockDim.y);
+
+    // Launch pooling kernel
+    maxPoolingKernel<<<poolGridDim, poolBlockDim>>>(d_convolved, d_pooled,
+                                                    width - FILTER_SIZE + 1,
+                                                    height - FILTER_SIZE + 1,
+                                                    POOLING_SIZE);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+
+    // Copy result back to host
+    Mat pooledResult(pooledHeight, pooledWidth, CV_8UC1);
+    CHECK_CUDA_ERROR(cudaMemcpy(pooledResult.data, d_pooled, pooledSize, cudaMemcpyDeviceToHost));
+
+    // Free device memory
+    CHECK_CUDA_ERROR(cudaFree(d_input));
+    CHECK_CUDA_ERROR(cudaFree(d_convolved));
+    CHECK_CUDA_ERROR(cudaFree(d_pooled));
+
+    return pooledResult;
+}
+
+// Print GPU information
+void printCudaDeviceInfo() {
+    int deviceCount = 0;
+    CHECK_CUDA_ERROR(cudaGetDeviceCount(&deviceCount));
+
+    cout << "CUDA Device Information:" << endl;
+    cout << "-----------------------" << endl;
+    cout << "Number of CUDA devices: " << deviceCount << endl;
+
+    for (int i = 0; i < deviceCount; i++) {
+        cudaDeviceProp deviceProp;
+        CHECK_CUDA_ERROR(cudaGetDeviceProperties(&deviceProp, i));
+
+        cout << "\nDevice " << i << ": " << deviceProp.name << endl;
+        cout << "  Compute capability: " << deviceProp.major << "." << deviceProp.minor << endl;
+        cout << "  Total global memory: " << deviceProp.totalGlobalMem / (1024 * 1024) << " MB" << endl;
+        cout << "  Multiprocessors: " << deviceProp.multiProcessorCount << endl;
+        cout << "  Max threads per block: " << deviceProp.maxThreadsPerBlock << endl;
+        cout << "  Max threads dimensions: ("
+             << deviceProp.maxThreadsDim[0] << ", "
+             << deviceProp.maxThreadsDim[1] << ", "
+             << deviceProp.maxThreadsDim[2] << ")" << endl;
+    }
+    cout << "-----------------------" << endl;
+}
+
+int main(int argc, char* argv[]) {
+    // Verify CUDA is available
+    int deviceCount = 0;
+    cudaError_t cudaStatus = cudaGetDeviceCount(&deviceCount);
+    if (cudaStatus != cudaSuccess || deviceCount == 0) {
+        cerr << "Error: No CUDA-capable devices found or CUDA driver not installed!" << endl;
+        cerr << "CUDA error: " << cudaGetErrorString(cudaStatus) << endl;
+        return -1;
     }
 
-    auto start = high_resolution_clock::now();
-    for (size_t i = 0; i < images.size(); i++) {
-        vector<Mat> convolved_images = conv2D(images[i].string());
-        if (!convolved_images.empty()) {
-            Mat last_convolved = convolved_images.back();
-            Mat pooled_image = pool2D_max(last_convolved);
-            string filename = images[i].filename().string();
-            string output_filename = "final_" + filename;
-            imwrite(IMG_PATH_FINAL + output_filename, pooled_image);
+    // Print CUDA device information
+    printCudaDeviceInfo();
+
+    // Set default paths based on platform
+#ifdef _WIN32
+    string defaultInputDir = "..\\..\\data\\images";
+        string defaultOutputDir = "..\\..\\data\\gpu_output";
+#else
+    string defaultInputDir = "../../data/images";
+    string defaultOutputDir = "../../data/gpu_output";
+#endif
+
+    // Parse command line arguments for input/output directories
+    string inputDir = defaultInputDir;
+    string outputDir = defaultOutputDir;
+
+    for (int i = 1; i < argc; i++) {
+        string arg = argv[i];
+        if ((arg == "-i" || arg == "--input") && i + 1 < argc) {
+            inputDir = argv[++i];
+        } else if ((arg == "-o" || arg == "--output") && i + 1 < argc) {
+            outputDir = argv[++i];
+        } else if (arg == "-h" || arg == "--help") {
+            cout << "Usage: " << argv[0] << " [options]" << endl;
+            cout << "Options:" << endl;
+            cout << "  -i, --input DIR   Input directory containing images (default: " << defaultInputDir << ")" << endl;
+            cout << "  -o, --output DIR  Output directory for processed images (default: " << defaultOutputDir << ")" << endl;
+            cout << "  -h, --help        Display this help message" << endl;
+            return 0;
         }
     }
-    auto end = high_resolution_clock::now();
-    auto duration_ms = duration_cast<milliseconds>(end - start);
-    cout << "Time taken: " << duration_ms.count() << " ms" << endl;
+
+    cout << "Input directory: " << inputDir << endl;
+    cout << "Output directory: " << outputDir << endl;
+
+    // Start total processing timer
+    auto total_start = high_resolution_clock::now();
+
+    // Create output directory if it doesn't exist
+    if (!directoryExists(outputDir)) {
+        if (!createDirectory(outputDir)) {
+            cerr << "Error: Could not create output directory '" << outputDir << "'!" << endl;
+            return -1;
+        }
+        cout << "Created output directory: " << outputDir << endl;
+    }
+
+    // Get all image files in the input directory
+    vector<string> imageFiles = getImageFiles(inputDir);
+
+    if (imageFiles.empty()) {
+        cerr << "Error: No image files found in " << inputDir << endl;
+        return -1;
+    }
+
+    // Initialize counters and timers
+    int processed_count = 0;
+    int failed_count = 0;
+    long long total_processing_time = 0;
+
+    cout << "Starting processing of " << imageFiles.size() << " images..." << endl;
+
+    // Process each image
+    for (const auto &imagePath : imageFiles) {
+        auto image_start = high_resolution_clock::now();
+
+        // Load image
+        Mat image = imread(imagePath, IMREAD_GRAYSCALE);
+        if (image.empty()) {
+            cerr << "Warning: Could not load image " << imagePath << " - skipping" << endl;
+            failed_count++;
+            continue;
+        }
+
+        // Process image using CUDA
+        Mat result = applyConvAndPoolCUDA(image);
+        if (result.empty()) {
+            cerr << "Warning: Processing failed for " << imagePath << " - skipping" << endl;
+            failed_count++;
+            continue;
+        }
+
+        // Create output filename
+        string filename = getFilenameFromPath(imagePath);
+        string outputPath = outputDir + PATH_SEPARATOR + "final_" + filename;
+
+        // Save result
+        if (!imwrite(outputPath, result)) {
+            cerr << "Warning: Failed to save " << outputPath << endl;
+            failed_count++;
+            continue;
+        }
+
+        auto image_end = high_resolution_clock::now();
+        auto image_duration = duration_cast<milliseconds>(image_end - image_start);
+        total_processing_time += image_duration.count();
+        processed_count++;
+    }
+
+    auto total_end = high_resolution_clock::now();
+    auto total_duration = duration_cast<milliseconds>(total_end - total_start);
+
+    // Print summary
+    cout << "\nProcessing complete!" << endl;
+    cout << "=================================" << endl;
+    cout << "Total images processed: " << processed_count << endl;
+    cout << "Failed to process: " << failed_count << endl;
+    cout << "Total processing time: " << total_duration.count() << " ms" << endl;
+    cout << "=================================" << endl;
+
     return 0;
-}
-
-// Get the current working directory in a cross-platform way
-string getCurrDir()
-{
-    char cwd[1024];
-    if (GETCWD(cwd, sizeof(cwd)) != nullptr) return string(cwd);
-    cerr << "Failed to get current working directory." << endl;
-    return string();
-}
-
-// List all files in the given directory path
-vector<fs::path> getFiles(const string &path)
-{
-    vector<fs::path> files;
-    for (const auto &entry : fs::directory_iterator(path)) files.push_back(entry.path());
-    return files;
-}
-
-// Perform 2D convolution on the input image with six predefined 3x3 filters
-vector<Mat> conv2D(const string &image_path)
-{
-    vector<vector<int>> filter_vertical{{0,1,0},{0,1,0},{0,1,0}};
-    vector<vector<int>> filter_horizontal{{0,0,0},{1,1,1},{0,0,0}};
-    vector<vector<int>> filter_diag1{{0,0,1},{0,1,0},{1,0,0}};
-    vector<vector<int>> filter_diag2{{1,0,0},{0,1,0},{0,0,1}};
-    vector<vector<int>> filter_x{{1,0,1},{0,1,0},{1,0,1}};
-    vector<vector<int>> filter_round{{0,1,0},{1,0,1},{0,1,0}};
-
-    Mat image = imread(image_path, IMREAD_GRAYSCALE);
-    if (image.empty()) { cerr << "Warning: Unable to read image " << image_path << endl; return {}; }
-
-    int out_width  = image.cols - FILTER_SIZE + 1;
-    int out_height = image.rows - FILTER_SIZE + 1;
-    Mat out_vert   = Mat::zeros(out_height, out_width, CV_8UC1);
-    Mat out_horiz  = Mat::zeros(out_height, out_width, CV_8UC1);
-    Mat out_d1     = Mat::zeros(out_height, out_width, CV_8UC1);
-    Mat out_d2     = Mat::zeros(out_height, out_width, CV_8UC1);
-    Mat out_x      = Mat::zeros(out_height, out_width, CV_8UC1);
-    Mat out_round  = Mat::zeros(out_height, out_width, CV_8UC1);
-
-    for (int i = 0; i < out_height; i++) {
-        for (int j = 0; j < out_width; j++) {
-            int sv=0, sh=0, s1=0, s2=0, sx=0, sr=0;
-            for (int fi=0; fi<FILTER_SIZE; fi++) {
-                for (int fj=0; fj<FILTER_SIZE; fj++) {
-                    int p = image.at<uchar>(i+fi, j+fj);
-                    sv += p*filter_vertical[fi][fj];
-                    sh += p*filter_horizontal[fi][fj];
-                    s1 += p*filter_diag1[fi][fj];
-                    s2 += p*filter_diag2[fi][fj];
-                    sx += p*filter_x[fi][fj];
-                    sr += p*filter_round[fi][fj];
-                }
-            }
-            out_vert.at<uchar>(i,j)=sv;
-            out_horiz.at<uchar>(i,j)=sh;
-            out_d1.at<uchar>(i,j)=s1;
-            out_d2.at<uchar>(i,j)=s2;
-            out_x.at<uchar>(i,j)=sx;
-            out_round.at<uchar>(i,j)=sr;
-        }
-    }
-    return {out_vert, out_horiz, out_d1, out_d2, out_x, out_round};
-}
-
-// Perform max-pooling with a 3x3 window on a single-channel image
-Mat pool2D_max(const Mat &image)
-{
-    if (image.empty()) { cerr << "Warning: Empty image passed to pooling." << endl; return Mat(); }
-    int pooled_w = image.cols / POOLING_SIZE;
-    int pooled_h = image.rows / POOLING_SIZE;
-    Mat pooled = Mat::zeros(pooled_h, pooled_w, CV_8UC1);
-
-    for (int i=0; i<pooled_h; i++) {
-        for (int j=0; j<pooled_w; j++) {
-            int mval = numeric_limits<int>::min();
-            for (int pi=0; pi<POOLING_SIZE; pi++) {
-                for (int pj=0; pj<POOLING_SIZE; pj++) {
-                    int y=i*POOLING_SIZE+pi, x=j*POOLING_SIZE+pj;
-                    if (y<image.rows && x<image.cols)
-                        mval = max(mval, (int)image.at<uchar>(y,x));
-                }
-            }
-            pooled.at<uchar>(i,j)=static_cast<uchar>(mval);
-        }
-    }
-    return pooled;
 }

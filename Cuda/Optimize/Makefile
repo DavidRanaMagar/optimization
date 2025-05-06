@@ -6,14 +6,14 @@ ifeq ($(OS),Windows_NT)
     SHELL = cmd
     RM = del /Q /F
     RM_DIR = rmdir /S /Q
-    EXECUTABLE = cuda_cnn.exe
+    EXECUTABLE = CNN_Optimize_GPU.exe
     PATHSEP = \\
     CUDA_PATH ?= C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8
 else
     PLATFORM = LINUX
     RM = rm -f
     RM_DIR = rm -rf
-    EXECUTABLE = cuda_cnn
+    EXECUTABLE = CNN_Optimize_GPU
     PATHSEP = /
     CUDA_PATH ?= /usr/local/cuda
 endif
@@ -46,11 +46,11 @@ else
 endif
 
 # Common settings
-SRC = CNN_GPU.cu
+SRC = CNN_Optimize_GPU.cu
 OBJ = $(SRC:.cu=.o)
 CUDA_LIBS = -lcudart
 INCLUDES = -I. $(CUDA_INCLUDE) $(OPENCV_INCLUDE)
-OUTPUT_DIR = ..$(PATHSEP)data$(PATHSEP)gpu_output
+OUTPUT_DIR = ..$(PATHSEP)..$(PATHSEP)data$(PATHSEP)gpu_optimal_output
 
 # Targets
 all: $(EXECUTABLE)

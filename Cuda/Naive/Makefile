@@ -46,11 +46,11 @@ else
 endif
 
 # Common settings
-SRC = CNN_Naive_GPU.cu
+SRC = CNN_Optimize_GPU.cu
 OBJ = $(SRC:.cu=.o)
 CUDA_LIBS = -lcudart
 INCLUDES = -I. $(CUDA_INCLUDE) $(OPENCV_INCLUDE)
-OUTPUT_DIR = ..$(PATHSEP)data$(PATHSEP)gpu_output
+OUTPUT_DIR = ..$(PATHSEP)..$(PATHSEP)data$(PATHSEP)gpu_naive_output
 
 # Targets
 all: $(EXECUTABLE)
