@@ -29,7 +29,7 @@
  namespace fs = filesystem;
  
  // Input/output paths
- #define IMG_PATH           "data/training_set/cats/"
+ #define IMG_PATH           "data/training_set/1000_images/"
  #define GPU_OUTPUT_PATH    "data/gpu_naive_output/"
  
  // Filter and pooling dimensions

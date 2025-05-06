@@ -45,7 +45,7 @@
  namespace fs = std::filesystem;
  
  // Cross-platform default paths
- #define IMG_PATH "data/training_set/cats/"     // Input images directory
+ #define IMG_PATH "data/training_set/1000_images/"     // Input images directory
  #define IMG_PATH_FINAL "data/cpu_output/"      // Output images directory
  
  #define FILTER_SIZE 3     // Convolution filter size (3x3)
