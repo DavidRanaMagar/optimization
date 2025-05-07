@@ -46,7 +46,7 @@ namespace fs = std::filesystem;
 
 // Cross-platform default paths
 #define IMG_PATH "../data/images/"     // Input images directory
-#define IMG_PATH_FINAL "./../data/cpu_output/"      // Output images directory
+#define IMG_PATH_FINAL "../data/cpu_output/"      // Output images directory
 
 #define FILTER_SIZE 3     // Convolution filter size (3x3)
 #define POOLING_SIZE 3    // Max-pooling window size (3x3)
